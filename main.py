@@ -102,18 +102,21 @@ async def cmd_upload(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_upload)
     await message.answer("📤 <b>Upload Mode Activated</b>\nSend me any file (Photo, Video, PDF, etc.) to store it in the database.")
 
-@router.message(Command("cancel"))
-async def cancel_state(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("🚫 <b>Action cancelled. Exited upload mode.</b>")
-
-# ~F.text.startswith('/') ensures it ignores commands like /cancel
-@router.message(BotStates.waiting_for_upload, ~F.text.startswith('/'))
+@router.message(BotStates.waiting_for_upload)
 async def process_upload(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
 
-    # Forward the file to the private channel
+    # 1. Intercept commands so they are NOT saved as files
+    if message.text and message.text.startswith('/'):
+        if message.text.lower() == '/cancel':
+            await state.clear()
+            await message.answer("🚫 <b>Action cancelled. Exited upload mode.</b>")
+        else:
+            await message.answer("⚠️ <b>Upload Mode is Active.</b>\nPlease send a file, or type /cancel to exit.")
+        return
+
+    # 2. Forward the file to the private channel
     try:
         copied_msg = await bot.copy_message(
             chat_id=CHANNEL_ID,
@@ -176,6 +179,12 @@ async def process_delete_link(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     
+    # Safely cancel out of delete mode if the admin types /cancel
+    if message.text and message.text.lower() == '/cancel':
+        await state.clear()
+        await message.answer("🚫 <b>Action cancelled. Exited delete mode.</b>")
+        return
+
     try:
         # Extract the unique ID from the link
         link_id = message.text.split("?start=")[-1]
@@ -225,4 +234,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
