@@ -75,10 +75,12 @@ async def cmd_start(message: Message, command: CommandObject = None):
             for row in results:
                 msg_id = row[0]
                 try:
+                    # Added caption="" to strip the link when delivering to the user
                     sent_msg = await bot.copy_message(
                         chat_id=message.from_user.id,
                         from_chat_id=CHANNEL_ID,
-                        message_id=msg_id
+                        message_id=msg_id,
+                        caption="" 
                     )
                     sent_message_ids.append(sent_msg.message_id)
                 except Exception as e:
