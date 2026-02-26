@@ -14,13 +14,12 @@ API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
 TERABOX_BOT_TOKEN = os.getenv("TERABOX_BOT_TOKEN", "YOUR_TERABOX_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-100YOUR_CHANNEL_ID_HERE")) 
 XAPI_KEY = os.getenv("XAPI_KEY", "YOUR_XAPIVERSE_KEY")
-FILESHARE_BOT_USERNAME = os.getenv("FILESHARE_BOT_USERNAME", "FSB69_BOT") # Without the @
+FILESHARE_BOT_USERNAME = os.getenv("FILESHARE_BOT_USERNAME", "FSB69_BOT")
 
-TEMP_MSG_DELETE_TIME = 120 # 2 mins auto-delete
+TEMP_MSG_DELETE_TIME = 120 
 
 logging.basicConfig(level=logging.INFO)
 
-# Notice we use a different session name so it doesn't conflict with FileShareBot
 app = Client(
     "terabox_bot",
     api_id=API_ID,
@@ -30,7 +29,6 @@ app = Client(
 )
 
 # ================= Database Setup =================
-# Connects to the EXACT SAME database your FileShareBot uses
 conn = sqlite3.connect('bot_database.db', check_same_thread=False)
 cursor = conn.cursor()
 
@@ -58,7 +56,6 @@ async def cmd_start(client, message):
 
 @app.on_callback_query(filters.regex("terabox_start"))
 async def callback_download_more(client, callback_query):
-    # This triggers when they click "Download More"
     await callback_query.message.reply_text("<blockquote>✨ **Send A Terabox Video Link 🙌**</blockquote>")
     await callback_query.answer()
 
@@ -66,8 +63,7 @@ async def callback_download_more(client, callback_query):
 async def process_terabox_link(client, message):
     text = message.text.lower()
     
-    # 1. Reject non-Terabox links instantly
-    if "terabox" not in text:
+    if "terabox" not in text and "1024tera" not in text:
         await safe_delete(message)
         err = await message.reply_text("<blockquote>⚠️ **Please send a valid Terabox link.**</blockquote>")
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
@@ -75,11 +71,9 @@ async def process_terabox_link(client, message):
 
     await safe_delete(message)
     
-    # --- ANIMATION STEP 1: VALIDATING ---
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
     anim_msg = await message.reply_text("<blockquote>🔍 **Validating Terabox link...**\n[■□□□□] 20%</blockquote>")
 
-    # 2. Fetch Direct Link via xAPIVERSE
     api_url = 'https://xapiverse.com/api/terabox-pro'
     headers = {
         'Content-Type': 'application/json',
@@ -88,14 +82,25 @@ async def process_terabox_link(client, message):
     payload = {"url": message.text}
     
     video_url = None
+    file_name = "terabox_video.mp4" # Default fallback
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(api_url, json=payload, headers=headers) as resp:
                 data = await resp.json()
-                # Adjust this extraction based on xAPIVERSE's exact JSON response format
-                video_url = data.get("url") or data.get("data", {}).get("url") or data.get("video_url")
+                
+                # --- THE FIX: Parsing the JSON properly based on your endpoint test ---
+                if data.get("status") == "success" and data.get("list"):
+                    # Grab the first file in the list
+                    file_data = data["list"][0]
+                    # Prefer the fast_download_link, fallback to normal download_link
+                    video_url = file_data.get("fast_download_link") or file_data.get("download_link")
+                    file_name = file_data.get("name", "terabox_video.mp4")
+                else:
+                    raise Exception("API returned an error or empty list.")
+                    
     except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ **API Connection Error:**\n{e}</blockquote>")
+        await anim_msg.edit_text(f"<blockquote>❌ **API Extraction Error:**\n{e}</blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
@@ -104,19 +109,19 @@ async def process_terabox_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    # --- ANIMATION STEP 2: DOWNLOADING ---
     await anim_msg.edit_text("<blockquote>⬇️ **Downloading to Render memory...**\n[■■■□□] 60%</blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.RECORD_VIDEO)
     
     os.makedirs("downloads", exist_ok=True)
-    local_filename = f"downloads/terabox_{secrets.token_hex(4)}.mp4"
+    # Give it a unique local name so concurrent downloads don't overwrite each other
+    local_filename = f"downloads/{secrets.token_hex(4)}_{file_name}"
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(video_url) as resp:
                 async with aiofiles.open(local_filename, mode='wb') as f:
                     while True:
-                        chunk = await resp.content.read(1024 * 1024) # 1MB chunks
+                        chunk = await resp.content.read(1024 * 1024) 
                         if not chunk: break
                         await f.write(chunk)
     except Exception as e:
@@ -124,7 +129,6 @@ async def process_terabox_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    # --- ANIMATION STEP 3: UPLOADING TO PRIVATE CHANNEL ---
     await anim_msg.edit_text("<blockquote>📤 **Uploading to secure vault...**\n[■■■■□] 80%</blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
 
@@ -140,36 +144,30 @@ async def process_terabox_link(client, message):
             has_spoiler=True
         )
         
-        # INSERT INTO SHARED DATABASE
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.id))
         conn.commit()
 
-        # --- ANIMATION STEP 4: DELIVERING ---
         await anim_msg.edit_text("<blockquote>✅ **Finalizing Delivery...**\n[■■■■■] 100%</blockquote>")
         
-        # Add the Download More button
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download More", callback_data="terabox_start")]])
         
-        # Send the file directly to the user
         await client.copy_message(
             chat_id=message.chat.id,
             from_chat_id=CHANNEL_ID,
             message_id=saved_msg.id,
-            caption="\u200B", # Clean UI
+            caption="\u200B", 
             reply_markup=keyboard
         )
 
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ **Upload error:**\n{e}</blockquote>")
     finally:
-        # ALWAYS DELETE FROM RENDER MEMORY
         if os.path.exists(local_filename):
             os.remove(local_filename)
         
-        # Delete the animation message to keep chat clean
         await safe_delete(anim_msg)
 
 if __name__ == "__main__":
     print("Starting Terabox Bot...")
     app.run()
-  
+        
