@@ -96,7 +96,7 @@ async def cmd_upload(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_upload)
     await message.answer("📤 <b>Upload Mode Activated</b>\nSend me any file (Photo, Video, PDF, etc.) to store it in the database.")
 
-@router.message(BotStates.waiting_for_upload, F.any_kwargs)
+@router.message(BotStates.waiting_for_upload)
 async def process_upload(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
