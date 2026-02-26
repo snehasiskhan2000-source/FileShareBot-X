@@ -5,7 +5,7 @@ import sqlite3
 import base64
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -57,7 +57,13 @@ async def auto_delete_task(chat_id: int, message_id: int):
 # ================= User Commands =================
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject = None):
-    args = message.text.split()
+    # Instantly delete the user's /start message to keep it hidden
+    try:
+        await message.delete()
+    except Exception:
+        pass # Ignore if it fails for any reason
+        
+    args = message.text.split() if message.text else []
     
     # If the user clicked a special link (e.g., /start YmF0Y2g...)
     if len(args) > 1:
@@ -96,7 +102,13 @@ async def cmd_upload(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_upload)
     await message.answer("📤 <b>Upload Mode Activated</b>\nSend me any file (Photo, Video, PDF, etc.) to store it in the database.")
 
-@router.message(BotStates.waiting_for_upload)
+@router.message(Command("cancel"))
+async def cancel_state(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🚫 <b>Action cancelled. Exited upload mode.</b>")
+
+# ~F.text.startswith('/') ensures it ignores commands like /cancel
+@router.message(BotStates.waiting_for_upload, ~F.text.startswith('/'))
 async def process_upload(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
@@ -124,11 +136,6 @@ async def process_upload(message: Message, state: FSMContext):
         )
     except Exception as e:
         await message.answer(f"❌ <b>Error storing file:</b> {e}")
-
-@router.message(Command("cancel"))
-async def cancel_state(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("🚫 <b>Action cancelled.</b>")
 
 # ================= Admin Panel Logic =================
 @router.message(Command("admin"))
@@ -218,4 +225,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-      
+    
