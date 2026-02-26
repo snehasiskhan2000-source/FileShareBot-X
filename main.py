@@ -10,13 +10,14 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatAction
 
 # ================= Configuration =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-100YOUR_CHANNEL_ID_HERE")) 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "YOUR_ADMIN_ID_HERE"))
-AUTO_DELETE_TIME = 300 # 5 minutes for files
-TEMP_MSG_DELETE_TIME = 120 # 2 minutes for temporary bot messages
+AUTO_DELETE_TIME = 300 
+TEMP_MSG_DELETE_TIME = 120 
 PORT = int(os.getenv("PORT", 8080)) 
 
 logging.basicConfig(level=logging.INFO)
@@ -44,14 +45,12 @@ media_group_cache = {}
 
 # ================= Utility Functions =================
 async def safe_delete(message: Message):
-    """Instantly deletes a message and ignores errors if it fails."""
     try:
         await message.delete()
     except Exception:
         pass
 
 async def delete_after(chat_id: int, message_id: int, delay: int):
-    """Waits for a specific delay, then deletes a single message."""
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -59,16 +58,14 @@ async def delete_after(chat_id: int, message_id: int, delay: int):
         pass
 
 async def auto_delete_batch_task(chat_id: int, message_ids: list):
-    """Waits for 5 minutes, then deletes a batch of messages (used for files)."""
     await asyncio.sleep(AUTO_DELETE_TIME)
     for msg_id in message_ids:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception as e:
-            logging.error(f"Could not auto-delete message {msg_id}: {e}")
+        except Exception:
+            pass
 
 async def track_msg(state: FSMContext, msg_id: int):
-    """Tracks temporary bot messages in state so they can be instantly wiped on /cancel."""
     data = await state.get_data()
     temp_msgs = data.get("temp_msgs", [])
     temp_msgs.append(msg_id)
@@ -77,10 +74,7 @@ async def track_msg(state: FSMContext, msg_id: int):
 # ================= Global Command Catchers =================
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
-    # 1. Instantly delete the /cancel command
     await safe_delete(message)
-    
-    # 2. Instantly wipe any tracked temporary bot messages (upload/error messages)
     data = await state.get_data()
     temp_msgs = data.get("temp_msgs", [])
     for msg_id in temp_msgs:
@@ -88,20 +82,15 @@ async def cmd_cancel(message: Message, state: FSMContext):
             await bot.delete_message(chat_id=message.chat.id, message_id=msg_id)
         except Exception:
             pass
-            
     await state.clear()
     
-    # 3. Send confirmation and auto-delete it after 2 minutes
-    msg = await message.answer("🚫 <b>Action cancelled. Exited current mode.</b>")
+    msg = await message.answer("<blockquote>🚫 <b>Action Cancelled</b>\nExited current mode safely.</blockquote>")
     asyncio.create_task(delete_after(msg.chat.id, msg.message_id, TEMP_MSG_DELETE_TIME))
 
-
-# ================= User Commands =================
+# ================= User Commands (Download Logic) =================
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject = None):
-    # Instantly delete /start
     await safe_delete(message)
-        
     args = message.text.split() if message.text else []
     
     if len(args) > 1:
@@ -110,10 +99,19 @@ async def cmd_start(message: Message, command: CommandObject = None):
         results = cursor.fetchall()
         
         if results:
-            # Add the warning message to the sent_message_ids so it gets deleted WITH the files
-            warning_msg = await message.answer(f"⏳ <i>Sending {len(results)} file(s)... This will self-destruct in {AUTO_DELETE_TIME // 60} minutes.</i>")
-            sent_message_ids = [warning_msg.message_id] 
+            # --- EXTRACTION ANIMATION ---
+            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+            anim_msg = await message.answer("<blockquote>🔍 <b>Locating secure files...</b></blockquote>")
+            await asyncio.sleep(0.4)
+            await anim_msg.edit_text("<blockquote>🔓 <b>Decrypting access...</b></blockquote>")
+            await asyncio.sleep(0.4)
             
+            warning_text = f"<blockquote>⏳ <b>Sending {len(results)} file(s)...</b>\n⚠️ <i>This batch will self-destruct in {AUTO_DELETE_TIME // 60} minutes.</i></blockquote>"
+            await anim_msg.edit_text(warning_text)
+            sent_message_ids = [anim_msg.message_id] 
+            
+            # Send files
+            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
             for row in results:
                 msg_id = row[0]
                 try:
@@ -124,52 +122,44 @@ async def cmd_start(message: Message, command: CommandObject = None):
                         caption="\u200B" 
                     )
                     sent_message_ids.append(sent_msg.message_id)
-                except Exception as e:
-                    logging.error(f"Failed to copy file {msg_id}: {e}")
+                except Exception:
+                    pass
             
             if len(sent_message_ids) > 1:
                 asyncio.create_task(auto_delete_batch_task(message.from_user.id, sent_message_ids))
         else:
-            err_msg = await message.answer("❌ <b>Invalid or expired link.</b>")
+            err_msg = await message.answer("<blockquote>❌ <b>Access Denied</b>\nInvalid or expired link.</blockquote>")
             asyncio.create_task(delete_after(err_msg.chat.id, err_msg.message_id, TEMP_MSG_DELETE_TIME))
     else:
         welcome_msg = await message.answer(
-            "✨ <b>Welcome to FileShareBot</b> ✨\n\n"
-            "🛡 <i>I can securely deliver files to you.</i>"
+            "<blockquote>✨ <b>Welcome to FileShareBot</b> ✨\n"
+            "🛡 <i>The ultimate tool for secure file distribution.</i></blockquote>"
         )
-        # Auto-delete Welcome message after 2 mins
         asyncio.create_task(delete_after(welcome_msg.chat.id, welcome_msg.message_id, TEMP_MSG_DELETE_TIME))
 
 # ================= Hidden Upload Logic =================
 @router.message(Command("upload"))
 async def cmd_upload(message: Message, state: FSMContext):
-    # Instantly delete /upload
     await safe_delete(message)
-    
-    if message.from_user.id != ADMIN_ID:
-        return 
+    if message.from_user.id != ADMIN_ID: return 
     
     await state.set_state(BotStates.waiting_for_upload)
     msg = await message.answer(
-        "🚀 <b>Upload Mode Activated</b> 🚀\n\n"
-        "📁 <i>Send me any file (or multiple files at once) to securely store them.</i>"
+        "<blockquote>🚀 <b>Upload Mode Activated</b>\n"
+        "📁 <i>Send me any file (or batch) to securely store them.</i></blockquote>"
     )
-    # Track to wipe if user types /cancel
     await track_msg(state, msg.message_id)
-    # Also set fallback 2-minute timer
     asyncio.create_task(delete_after(msg.chat.id, msg.message_id, TEMP_MSG_DELETE_TIME))
 
 @router.message(BotStates.waiting_for_upload, F.text)
 async def process_upload_text(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
-    
-    # Instantly delete their invalid text message
     await safe_delete(message)
     
     err_msg = await message.answer(
-        "⚠️ <b>Text not allowed!</b>\n"
+        "<blockquote>⚠️ <b>Text not allowed!</b>\n"
         "Please send a FILE (Photo, Video, Document).\n"
-        "💡 Type /cancel to exit."
+        "💡 <i>Type /cancel to exit.</i></blockquote>"
     )
     await track_msg(state, err_msg.message_id)
     asyncio.create_task(delete_after(err_msg.chat.id, err_msg.message_id, TEMP_MSG_DELETE_TIME))
@@ -183,6 +173,7 @@ async def process_upload_media(message: Message, state: FSMContext):
         if message.media_group_id in media_group_cache:
             link_id = media_group_cache[message.media_group_id]
             is_first = False
+            anim_msg = None
         else:
             link_id = secrets.token_urlsafe(8)
             media_group_cache[message.media_group_id] = link_id
@@ -195,66 +186,51 @@ async def process_upload_media(message: Message, state: FSMContext):
     share_link = f"https://t.me/{bot_info.username}?start={link_id}"
     
     original_caption = message.html_text or ""
-    new_caption = f"{original_caption}\n\n🔗 <b>Access Link:</b>\n<code>{share_link}</code>".strip()
+    new_caption = f"{original_caption}\n\n<blockquote>🔗 <b>Access Link:</b>\n<code>{share_link}</code></blockquote>".strip()
+
+    # --- UPLOAD PROGRESS ANIMATION ---
+    if is_first:
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+        anim_msg = await message.answer("<blockquote>🔄 <b>Processing payload...</b>\n[■□□□□] 20%</blockquote>")
+        await track_msg(state, anim_msg.message_id)
+        await asyncio.sleep(0.3)
+        await anim_msg.edit_text("<blockquote>⏳ <b>Encrypting data...</b>\n[■■■□□] 60%</blockquote>")
+        await asyncio.sleep(0.3)
+        await anim_msg.edit_text("<blockquote>🔐 <b>Generating link...</b>\n[■■■■■] 100%</blockquote>")
 
     try:
         if message.video:
-            saved_msg = await bot.send_video(
-                chat_id=CHANNEL_ID,
-                video=message.video.file_id,
-                caption=new_caption,
-                parse_mode="HTML",
-                has_spoiler=True
-            )
+            saved_msg = await bot.send_video(chat_id=CHANNEL_ID, video=message.video.file_id, caption=new_caption, parse_mode="HTML", has_spoiler=True)
         elif message.photo:
-            saved_msg = await bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=message.photo[-1].file_id,
-                caption=new_caption,
-                parse_mode="HTML"
-            )
+            saved_msg = await bot.send_photo(chat_id=CHANNEL_ID, photo=message.photo[-1].file_id, caption=new_caption, parse_mode="HTML")
         elif message.document:
-            saved_msg = await bot.send_document(
-                chat_id=CHANNEL_ID,
-                document=message.document.file_id,
-                caption=new_caption,
-                parse_mode="HTML"
-            )
+            saved_msg = await bot.send_document(chat_id=CHANNEL_ID, document=message.document.file_id, caption=new_caption, parse_mode="HTML")
         else:
-            saved_msg = await bot.copy_message(
-                chat_id=CHANNEL_ID,
-                from_chat_id=message.from_user.id,
-                message_id=message.message_id,
-                caption=new_caption,
-                parse_mode="HTML"
-            )
+            saved_msg = await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=message.from_user.id, message_id=message.message_id, caption=new_caption, parse_mode="HTML")
             
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.message_id))
         conn.commit()
         
-        if is_first:
-            success_msg = await message.answer(
-                "✅ <b>File(s) Uploaded Successfully!</b> 🎉\n"
-                "📦 <i>(Multiple files sent together are grouped under this single link)</i>\n\n"
+        if is_first and anim_msg:
+            success_text = (
+                "<blockquote>✅ <b>File(s) Uploaded Successfully!</b>\n"
+                "📦 <i>Grouped under a single secure link.</i></blockquote>\n"
                 "🔗 <b>Shareable Link:</b>\n"
                 f"<code>{share_link}</code>\n\n"
                 "💡 <i>Send more files or type /cancel to exit.</i>"
             )
-            await track_msg(state, success_msg.message_id)
-            asyncio.create_task(delete_after(success_msg.chat.id, success_msg.message_id, TEMP_MSG_DELETE_TIME))
+            await anim_msg.edit_text(success_text)
+            asyncio.create_task(delete_after(anim_msg.chat.id, anim_msg.message_id, TEMP_MSG_DELETE_TIME))
             
     except Exception as e:
-        if is_first:
-            err_msg = await message.answer(f"❌ <b>Error storing file:</b> {e}")
-            await track_msg(state, err_msg.message_id)
-            asyncio.create_task(delete_after(err_msg.chat.id, err_msg.message_id, TEMP_MSG_DELETE_TIME))
+        if is_first and anim_msg:
+            await anim_msg.edit_text(f"<blockquote>❌ <b>Error storing file:</b>\n{e}</blockquote>")
+            asyncio.create_task(delete_after(anim_msg.chat.id, anim_msg.message_id, TEMP_MSG_DELETE_TIME))
 
 # ================= Admin Panel Logic =================
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
-    # Instantly delete /admin
     await safe_delete(message)
-    
     if message.from_user.id != ADMIN_ID: return 
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -262,36 +238,29 @@ async def cmd_admin(message: Message):
         [InlineKeyboardButton(text="⚠️ Clear ALL Database", callback_data="admin_clear_all")]
     ])
     
-    await message.answer("⚙️ <b>Admin Control Panel</b>\nSelect an action below:", reply_markup=keyboard)
+    await message.answer("<blockquote>⚙️ <b>Admin Control Panel</b>\nSelect an action below:</blockquote>", reply_markup=keyboard)
 
 @router.callback_query(F.data == "admin_clear_all")
 async def process_clear_all(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    
     cursor.execute('DELETE FROM shared_files')
     conn.commit()
-    
-    await callback.message.edit_text("✅ <b>Database Cleared.</b>\nAll existing links have been invalidated.")
-    await callback.answer("Database wiped.")
+    await callback.message.edit_text("<blockquote>✅ <b>Database Cleared.</b>\nAll existing links are now dead.</blockquote>")
 
 @router.callback_query(F.data == "admin_clear_specific")
 async def process_clear_specific(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
-    
     await state.set_state(BotStates.waiting_for_delete_link)
-    await callback.message.answer("🔗 <b>Send me the special link</b> of the file(s) you want to delete:")
+    await callback.message.answer("<blockquote>🔗 <b>Target Acquisition</b>\nSend me the special link of the file(s) to delete:</blockquote>")
     await callback.answer()
 
 @router.message(BotStates.waiting_for_delete_link)
 async def process_delete_link(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
-
-    # User's invalid text/link gets safely deleted so chat stays clean
     await safe_delete(message)
 
     try:
         link_id = message.text.split("?start=")[-1]
-        
         cursor.execute('SELECT message_id FROM shared_files WHERE link_id = ?', (link_id,))
         results = cursor.fetchall()
         
@@ -306,13 +275,14 @@ async def process_delete_link(message: Message, state: FSMContext):
             cursor.execute('DELETE FROM shared_files WHERE link_id = ?', (link_id,))
             conn.commit()
             
-            await message.answer(f"✅ <b>{len(results)} File(s) permanently deleted</b> from the channel and database.")
+            msg = await message.answer(f"<blockquote>✅ <b>Purge Complete</b>\n{len(results)} file(s) permanently erased.</blockquote>")
+            asyncio.create_task(delete_after(msg.chat.id, msg.message_id, TEMP_MSG_DELETE_TIME))
         else:
-            err = await message.answer("❌ <b>Link not found in database.</b>")
+            err = await message.answer("<blockquote>❌ <b>Link not found in database.</b></blockquote>")
             asyncio.create_task(delete_after(err.chat.id, err.message_id, TEMP_MSG_DELETE_TIME))
             
     except Exception as e:
-        await message.answer(f"❌ <b>Error:</b> {e}")
+        await message.answer(f"<blockquote>❌ <b>Error:</b> {e}</blockquote>")
     finally:
         await state.clear()
 
@@ -337,4 +307,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
