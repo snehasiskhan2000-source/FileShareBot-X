@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import sqlite3
-import base64
+import secrets
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, CommandObject
@@ -12,12 +12,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
 
 # ================= Configuration =================
-# Replace these with your actual details, or use Environment Variables in Render
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-100YOUR_CHANNEL_ID_HERE")) 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "YOUR_ADMIN_ID_HERE"))
-AUTO_DELETE_TIME = 300 # Time in seconds (e.g., 300 = 5 minutes)
-PORT = int(os.getenv("PORT", 8080)) # Render assigns a PORT dynamically
+AUTO_DELETE_TIME = 300 
+PORT = int(os.getenv("PORT", 8080)) 
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
@@ -27,127 +26,175 @@ router = Router()
 # ================= Database Setup =================
 conn = sqlite3.connect('bot_database.db', check_same_thread=False)
 cursor = conn.cursor()
+# Upgraded table to support multiple files per link
 cursor.execute('''
-    CREATE TABLE IF NOT EXISTS files (
-        link_id TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS shared_files (
+        link_id TEXT,
         message_id INTEGER
     )
 ''')
 conn.commit()
 
-# ================= FSM States =================
+# ================= Globals & States =================
 class BotStates(StatesGroup):
     waiting_for_upload = State()
     waiting_for_delete_link = State()
 
-# ================= Utility Functions =================
-def generate_link_id(message_id: int) -> str:
-    """Encodes the message ID into a clean base64 string."""
-    raw_bytes = f"file_{message_id}".encode('utf-8')
-    return base64.urlsafe_b64encode(raw_bytes).decode('utf-8').rstrip("=")
+# Cache to group albums together into a single link
+media_group_cache = {}
 
-async def auto_delete_task(chat_id: int, message_id: int):
-    """Waits for the specified time, then deletes the message."""
+# ================= Utility Functions =================
+async def auto_delete_batch_task(chat_id: int, message_ids: list):
+    """Waits for the specified time, then deletes all messages in the batch."""
     await asyncio.sleep(AUTO_DELETE_TIME)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        logging.error(f"Could not auto-delete message: {e}")
+    for msg_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            logging.error(f"Could not auto-delete message {msg_id}: {e}")
 
 # ================= User Commands =================
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject = None):
-    # Instantly delete the user's /start message to keep it hidden
     try:
         await message.delete()
     except Exception:
-        pass # Ignore if it fails for any reason
+        pass 
         
     args = message.text.split() if message.text else []
     
-    # If the user clicked a special link (e.g., /start YmF0Y2g...)
     if len(args) > 1:
         link_id = args[1]
-        cursor.execute('SELECT message_id FROM files WHERE link_id = ?', (link_id,))
-        result = cursor.fetchone()
+        cursor.execute('SELECT message_id FROM shared_files WHERE link_id = ?', (link_id,))
+        results = cursor.fetchall()
         
-        if result:
-            msg_id = result[0]
-            try:
-                # Copy file from private channel to user
-                sent_msg = await bot.copy_message(
-                    chat_id=message.from_user.id,
-                    from_chat_id=CHANNEL_ID,
-                    message_id=msg_id
-                )
-                
-                await message.answer(f"⏳ <i>This file will self-destruct in {AUTO_DELETE_TIME // 60} minutes.</i>")
-                
-                # Start the auto-delete timer
-                asyncio.create_task(auto_delete_task(message.from_user.id, sent_msg.message_id))
-            except Exception as e:
-                await message.answer("❌ <b>Error:</b> Could not retrieve the file. It may have been deleted by an admin.")
+        if results:
+            await message.answer(f"⏳ <i>Sending {len(results)} file(s)... This will self-destruct in {AUTO_DELETE_TIME // 60} minutes.</i>")
+            
+            sent_message_ids = []
+            for row in results:
+                msg_id = row[0]
+                try:
+                    sent_msg = await bot.copy_message(
+                        chat_id=message.from_user.id,
+                        from_chat_id=CHANNEL_ID,
+                        message_id=msg_id
+                    )
+                    sent_message_ids.append(sent_msg.message_id)
+                except Exception as e:
+                    logging.error(f"Failed to copy file {msg_id}: {e}")
+            
+            # Start timer for all files
+            if sent_message_ids:
+                asyncio.create_task(auto_delete_batch_task(message.from_user.id, sent_message_ids))
         else:
             await message.answer("❌ <b>Invalid or expired link.</b>")
     else:
-        # Standard Start Command
         await message.answer("<b>Welcome to FileShareBot 🙌</b>\n\nI can securely deliver files to you.")
 
 # ================= Hidden Upload Logic =================
 @router.message(Command("upload"))
 async def cmd_upload(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
-        return # Ignore if not admin
+        return 
     
     await state.set_state(BotStates.waiting_for_upload)
-    await message.answer("📤 <b>Upload Mode Activated</b>\nSend me any file (Photo, Video, PDF, etc.) to store it in the database.")
+    await message.answer("📤 <b>Upload Mode Activated</b>\nSend me any file (or multiple files at once).")
 
-@router.message(BotStates.waiting_for_upload)
-async def process_upload(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    # 1. Intercept commands so they are NOT saved as files
-    if message.text and message.text.startswith('/'):
+# 1. Handle Text (Reject it unless it's a command)
+@router.message(BotStates.waiting_for_upload, F.text)
+async def process_upload_text(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    
+    if message.text.startswith('/'):
         if message.text.lower() == '/cancel':
             await state.clear()
             await message.answer("🚫 <b>Action cancelled. Exited upload mode.</b>")
         else:
-            await message.answer("⚠️ <b>Upload Mode is Active.</b>\nPlease send a file, or type /cancel to exit.")
-        return
+            await message.answer("⚠️ <b>Upload Mode Active.</b>\nPlease send a file, or type /cancel to exit.")
+    else:
+        await message.answer("⚠️ <b>Text not allowed!</b>\nPlease send a FILE (Photo, Video, Document). Type /cancel to exit.")
 
-    # 2. Forward the file to the private channel
+# 2. Handle Media (Photos, Videos, Documents)
+@router.message(BotStates.waiting_for_upload, F.content_type.in_({'photo', 'video', 'document', 'audio', 'voice'}))
+async def process_upload_media(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+
+    is_media_group = message.media_group_id is not None
+    if is_media_group:
+        if message.media_group_id in media_group_cache:
+            link_id = media_group_cache[message.media_group_id]
+            is_first = False
+        else:
+            link_id = secrets.token_urlsafe(8)
+            media_group_cache[message.media_group_id] = link_id
+            is_first = True
+    else:
+        link_id = secrets.token_urlsafe(8)
+        is_first = True
+
+    bot_info = await bot.get_me()
+    share_link = f"https://t.me/{bot_info.username}?start={link_id}"
+    
+    # Attach link to channel file
+    original_caption = message.html_text or ""
+    new_caption = f"{original_caption}\n\n🔗 <b>Access Link:</b>\n<code>{share_link}</code>".strip()
+
     try:
-        copied_msg = await bot.copy_message(
-            chat_id=CHANNEL_ID,
-            from_chat_id=message.from_user.id,
-            message_id=message.message_id
-        )
-        
-        # Generate link and save to DB
-        link_id = generate_link_id(copied_msg.message_id)
-        cursor.execute('INSERT INTO files (link_id, message_id) VALUES (?, ?)', (link_id, copied_msg.message_id))
+        # Save video hiddenly (spoiler), save image raw
+        if message.video:
+            saved_msg = await bot.send_video(
+                chat_id=CHANNEL_ID,
+                video=message.video.file_id,
+                caption=new_caption,
+                parse_mode="HTML",
+                has_spoiler=True
+            )
+        elif message.photo:
+            saved_msg = await bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=message.photo[-1].file_id,
+                caption=new_caption,
+                parse_mode="HTML"
+            )
+        elif message.document:
+            saved_msg = await bot.send_document(
+                chat_id=CHANNEL_ID,
+                document=message.document.file_id,
+                caption=new_caption,
+                parse_mode="HTML"
+            )
+        else:
+            saved_msg = await bot.copy_message(
+                chat_id=CHANNEL_ID,
+                from_chat_id=message.from_user.id,
+                message_id=message.message_id,
+                caption=new_caption,
+                parse_mode="HTML"
+            )
+            
+        cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.message_id))
         conn.commit()
         
-        bot_info = await bot.get_me()
-        share_link = f"https://t.me/{bot_info.username}?start={link_id}"
-        
-        await message.answer(
-            f"✅ <b>File Uploaded Successfully!</b>\n\n"
-            f"🔗 <b>Shareable Link:</b>\n<code>{share_link}</code>\n\n"
-            f"<i>Send another file or type /cancel to exit upload mode.</i>"
-        )
+        # Only reply once per batch
+        if is_first:
+            await message.answer(
+                f"✅ <b>File(s) Uploaded Successfully!</b>\n"
+                f"(Multiple files sent together are grouped under this single link)\n\n"
+                f"🔗 <b>Shareable Link:</b>\n<code>{share_link}</code>\n\n"
+                f"<i>Send more files or type /cancel to exit.</i>"
+            )
     except Exception as e:
-        await message.answer(f"❌ <b>Error storing file:</b> {e}")
+        if is_first:
+            await message.answer(f"❌ <b>Error storing file:</b> {e}")
 
 # ================= Admin Panel Logic =================
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return # Ignore if not admin
+    if message.from_user.id != ADMIN_ID: return 
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Clear Specific File", callback_data="admin_clear_specific")],
+        [InlineKeyboardButton(text="🗑 Clear Specific Link", callback_data="admin_clear_specific")],
         [InlineKeyboardButton(text="⚠️ Clear ALL Database", callback_data="admin_clear_all")]
     ])
     
@@ -155,11 +202,9 @@ async def cmd_admin(message: Message):
 
 @router.callback_query(F.data == "admin_clear_all")
 async def process_clear_all(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
+    if callback.from_user.id != ADMIN_ID: return
     
-    # Clears the SQLite database mapping (links will stop working)
-    cursor.execute('DELETE FROM files')
+    cursor.execute('DELETE FROM shared_files')
     conn.commit()
     
     await callback.message.edit_text("✅ <b>Database Cleared.</b>\nAll existing links have been invalidated.")
@@ -167,40 +212,39 @@ async def process_clear_all(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_clear_specific")
 async def process_clear_specific(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
+    if callback.from_user.id != ADMIN_ID: return
     
     await state.set_state(BotStates.waiting_for_delete_link)
-    await callback.message.answer("🔗 <b>Send me the special link</b> of the file you want to delete:")
+    await callback.message.answer("🔗 <b>Send me the special link</b> of the file(s) you want to delete:")
     await callback.answer()
 
 @router.message(BotStates.waiting_for_delete_link)
 async def process_delete_link(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if message.from_user.id != ADMIN_ID: return
     
-    # Safely cancel out of delete mode if the admin types /cancel
     if message.text and message.text.lower() == '/cancel':
         await state.clear()
         await message.answer("🚫 <b>Action cancelled. Exited delete mode.</b>")
         return
 
     try:
-        # Extract the unique ID from the link
         link_id = message.text.split("?start=")[-1]
         
-        cursor.execute('SELECT message_id FROM files WHERE link_id = ?', (link_id,))
-        result = cursor.fetchone()
+        cursor.execute('SELECT message_id FROM shared_files WHERE link_id = ?', (link_id,))
+        results = cursor.fetchall()
         
-        if result:
-            msg_id = result[0]
-            # Delete from channel
-            await bot.delete_message(chat_id=CHANNEL_ID, message_id=msg_id)
-            # Delete from DB
-            cursor.execute('DELETE FROM files WHERE link_id = ?', (link_id,))
+        if results:
+            for row in results:
+                msg_id = row[0]
+                try:
+                    await bot.delete_message(chat_id=CHANNEL_ID, message_id=msg_id)
+                except Exception:
+                    pass # Ignore if already deleted manually
+            
+            cursor.execute('DELETE FROM shared_files WHERE link_id = ?', (link_id,))
             conn.commit()
             
-            await message.answer("✅ <b>File permanently deleted</b> from the channel and database.")
+            await message.answer(f"✅ <b>{len(results)} File(s) permanently deleted</b> from the channel and database.")
         else:
             await message.answer("❌ <b>Link not found in database.</b>")
             
@@ -224,14 +268,10 @@ async def web_server():
 # ================= Main Execution =================
 async def main():
     dp.include_router(router)
-    
-    # Start the keep-alive web server
     asyncio.create_task(web_server())
-    
-    # Start the bot
     print("Bot is running...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+    
