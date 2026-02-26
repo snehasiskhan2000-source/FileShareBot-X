@@ -26,7 +26,6 @@ router = Router()
 # ================= Database Setup =================
 conn = sqlite3.connect('bot_database.db', check_same_thread=False)
 cursor = conn.cursor()
-# Upgraded table to support multiple files per link
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS shared_files (
         link_id TEXT,
@@ -40,7 +39,6 @@ class BotStates(StatesGroup):
     waiting_for_upload = State()
     waiting_for_delete_link = State()
 
-# Cache to group albums together into a single link
 media_group_cache = {}
 
 # ================= Utility Functions =================
@@ -75,18 +73,17 @@ async def cmd_start(message: Message, command: CommandObject = None):
             for row in results:
                 msg_id = row[0]
                 try:
-                    # Added caption="" to strip the link when delivering to the user
+                    # THE FIX: remove_caption=True forces Telegram to strip the secret link
                     sent_msg = await bot.copy_message(
                         chat_id=message.from_user.id,
                         from_chat_id=CHANNEL_ID,
                         message_id=msg_id,
-                        caption="" 
+                        remove_caption=True
                     )
                     sent_message_ids.append(sent_msg.message_id)
                 except Exception as e:
                     logging.error(f"Failed to copy file {msg_id}: {e}")
             
-            # Start timer for all files
             if sent_message_ids:
                 asyncio.create_task(auto_delete_batch_task(message.from_user.id, sent_message_ids))
         else:
@@ -103,7 +100,6 @@ async def cmd_upload(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_upload)
     await message.answer("📤 <b>Upload Mode Activated</b>\nSend me any file (or multiple files at once).")
 
-# 1. Handle Text (Reject it unless it's a command)
 @router.message(BotStates.waiting_for_upload, F.text)
 async def process_upload_text(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
@@ -117,7 +113,6 @@ async def process_upload_text(message: Message, state: FSMContext):
     else:
         await message.answer("⚠️ <b>Text not allowed!</b>\nPlease send a FILE (Photo, Video, Document). Type /cancel to exit.")
 
-# 2. Handle Media (Photos, Videos, Documents)
 @router.message(BotStates.waiting_for_upload, F.content_type.in_({'photo', 'video', 'document', 'audio', 'voice'}))
 async def process_upload_media(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
@@ -138,12 +133,10 @@ async def process_upload_media(message: Message, state: FSMContext):
     bot_info = await bot.get_me()
     share_link = f"https://t.me/{bot_info.username}?start={link_id}"
     
-    # Attach link to channel file
     original_caption = message.html_text or ""
     new_caption = f"{original_caption}\n\n🔗 <b>Access Link:</b>\n<code>{share_link}</code>".strip()
 
     try:
-        # Save video hiddenly (spoiler), save image raw
         if message.video:
             saved_msg = await bot.send_video(
                 chat_id=CHANNEL_ID,
@@ -178,7 +171,6 @@ async def process_upload_media(message: Message, state: FSMContext):
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.message_id))
         conn.commit()
         
-        # Only reply once per batch
         if is_first:
             await message.answer(
                 f"✅ <b>File(s) Uploaded Successfully!</b>\n"
@@ -241,7 +233,7 @@ async def process_delete_link(message: Message, state: FSMContext):
                 try:
                     await bot.delete_message(chat_id=CHANNEL_ID, message_id=msg_id)
                 except Exception:
-                    pass # Ignore if already deleted manually
+                    pass 
             
             cursor.execute('DELETE FROM shared_files WHERE link_id = ?', (link_id,))
             conn.commit()
@@ -276,4 +268,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                        
