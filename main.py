@@ -73,12 +73,12 @@ async def cmd_start(message: Message, command: CommandObject = None):
             for row in results:
                 msg_id = row[0]
                 try:
-                    # THE FIX: remove_caption=True forces Telegram to strip the secret link
+                    # THE FIX: We use an invisible Zero-Width Space to trick Telegram into wiping the link
                     sent_msg = await bot.copy_message(
                         chat_id=message.from_user.id,
                         from_chat_id=CHANNEL_ID,
                         message_id=msg_id,
-                        remove_caption=True
+                        caption="\u200B" 
                     )
                     sent_message_ids.append(sent_msg.message_id)
                 except Exception as e:
@@ -268,4 +268,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                        
+        
