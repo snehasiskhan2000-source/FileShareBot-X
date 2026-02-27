@@ -32,49 +32,30 @@ app = Client(
 # ================= Database Setup =================
 conn = sqlite3.connect('bot_database.db', check_same_thread=False)
 cursor = conn.cursor()
-
-# 1. Existing table for FileShareBot
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS shared_files (
-        link_id TEXT,
-        message_id INTEGER
-    )
-''')
-
-# 2. NEW Table for caching Terabox links
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS terabox_cache (
-        terabox_url TEXT PRIMARY KEY,
-        message_id INTEGER
-    )
-''')
+cursor.execute('CREATE TABLE IF NOT EXISTS shared_files (link_id TEXT, message_id INTEGER)')
+cursor.execute('CREATE TABLE IF NOT EXISTS terabox_cache (terabox_url TEXT PRIMARY KEY, message_id INTEGER)')
 conn.commit()
 
 # ================= Utility Functions =================
 async def safe_delete(message):
-    try:
-        await message.delete()
-    except Exception:
-        pass
+    try: await message.delete()
+    except Exception: pass
 
 async def delete_after(client, chat_id, message_id, delay):
     await asyncio.sleep(delay)
-    try:
-        await client.delete_messages(chat_id, message_id)
-    except Exception:
-        pass
+    try: await client.delete_messages(chat_id, message_id)
+    except Exception: pass
 
 # ================= Bot Logic =================
-
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(client, message):
     await safe_delete(message)
-    msg = await message.reply_text("<blockquote>✨ **Send A Terabox Video Link 🙌**</blockquote>")
+    msg = await message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Our servers will handle the rest.</i></blockquote>")
     asyncio.create_task(delete_after(client, msg.chat.id, msg.id, TEMP_MSG_DELETE_TIME))
 
 @app.on_callback_query(filters.regex("terabox_start"))
 async def callback_download_more(client, callback_query):
-    await callback_query.message.reply_text("<blockquote>✨ **Send A Terabox Video Link 🙌**</blockquote>")
+    await callback_query.message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Ready for the next payload.</i></blockquote>")
     await callback_query.answer()
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start"]))
@@ -84,7 +65,7 @@ async def process_terabox_link(client, message):
     
     if "terabox" not in text and "1024tera" not in text:
         await safe_delete(message)
-        err = await message.reply_text("<blockquote>⚠️ **Please send a valid Terabox link.**</blockquote>")
+        err = await message.reply_text("<blockquote>⚠️ <b>Invalid protocol.</b>\nRequires a Terabox URL.</blockquote>")
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
         return
 
@@ -92,7 +73,7 @@ async def process_terabox_link(client, message):
     
     url_match = re.search(r"https?://[^\s]+", raw_text)
     if not url_match:
-        err = await message.reply_text("<blockquote>❌ **No valid URL found in the message.**</blockquote>")
+        err = await message.reply_text("<blockquote>❌ <b>Extraction Failed.</b> No valid URL detected.</blockquote>")
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
         return
         
@@ -104,66 +85,51 @@ async def process_terabox_link(client, message):
     
     if cached_result:
         msg_id = cached_result[0]
-        
-        # Generate fresh FileShareBot link for this user
         link_id = secrets.token_urlsafe(8)
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, msg_id))
         conn.commit()
         
-        # Deliver instantly
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download More", callback_data="terabox_start")]])
-        
-        await client.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=CHANNEL_ID,
-            message_id=msg_id,
-            caption="\u200B", 
-            reply_markup=keyboard
-        )
-        return # Stop execution here, no need to download!
+        await client.copy_message(chat_id=message.chat.id, from_chat_id=CHANNEL_ID, message_id=msg_id, caption="\u200B", reply_markup=keyboard)
+        return 
     # ==================================================================
 
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
-    anim_msg = await message.reply_text("<blockquote>🔍 **Validating Terabox link...**\n[■□□□□] 20%</blockquote>")
+    
+    # PREMIUM DOWNLOADING ANIMATION
+    anim_msg = await message.reply_text("<blockquote><code>[📡] Pinging xAPIVERSE servers...</code></blockquote>")
 
     api_url = 'https://xapiverse.com/api/terabox-pro'
     headers = {'Content-Type': 'application/json', 'xAPIverse-Key': XAPI_KEY}
     payload = {"url": clean_url} 
     
-    video_url = None
-    file_name = "terabox_video.mp4" 
-    
-    # Custom timeout to prevent Render from killing long API requests
+    video_url, file_name = None, "terabox_video.mp4" 
     timeout = aiohttp.ClientTimeout(total=3600) 
     
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(api_url, json=payload, headers=headers) as resp:
                 data = await resp.json()
-                
                 if data.get("status") == "success" and data.get("list"):
                     file_data = data["list"][0]
-                    # STRICTLY grab the fast download link first
-                    video_url = file_data.get("fast_download_link")
-                    if not video_url:
-                        video_url = file_data.get("download_link")
-                        
+                    video_url = file_data.get("fast_download_link") or file_data.get("download_link")
                     file_name = file_data.get("name", "terabox_video.mp4")
                 else:
-                    api_error_msg = data.get("message", "API returned an error or empty list.")
-                    raise Exception(api_error_msg)
+                    raise Exception(data.get("message", "API returned an empty list."))
                     
     except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ **API Extraction Error:**\n{e}</blockquote>")
+        await anim_msg.edit_text(f"<blockquote>❌ <b>API Error:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
     if not video_url:
-        await anim_msg.edit_text("<blockquote>❌ **Failed to extract video.** The link might be dead or private.</blockquote>")
+        await anim_msg.edit_text("<blockquote>❌ <b>Extraction Failed.</b> Link dead or private.</blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    await anim_msg.edit_text("<blockquote>⬇️ **Downloading to Render memory...**\n[■■■□□] 60%</blockquote>")
+    await anim_msg.edit_text("<blockquote><code>[🔓] Bypassing Terabox security...</code></blockquote>")
+    await asyncio.sleep(0.5)
+    await anim_msg.edit_text("<blockquote><code>[📥] Downloading to Render...</code>\n<code>[████░░░░░░] 40%</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.RECORD_VIDEO)
     
     os.makedirs("downloads", exist_ok=True)
@@ -174,16 +140,15 @@ async def process_terabox_link(client, message):
             async with session.get(video_url) as resp:
                 async with aiofiles.open(local_filename, mode='wb') as f:
                     while True:
-                        # Increased chunk size to 2MB for slightly faster disk writing
                         chunk = await resp.content.read(2 * 1024 * 1024) 
                         if not chunk: break
                         await f.write(chunk)
     except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ **Download failed:**\n{e}\n\n*Render timeout or file too large.*</blockquote>")
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Download Interrupted:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    await anim_msg.edit_text("<blockquote>📤 **Uploading to secure vault...**\n[■■■■□] 80%</blockquote>")
+    await anim_msg.edit_text("<blockquote><code>[📤] Encrypting to secure vault...</code>\n<code>[████████░░] 80%</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
 
     link_id = secrets.token_urlsafe(8)
@@ -191,39 +156,21 @@ async def process_terabox_link(client, message):
     caption = f"🔗 **Access Link:**\n<code>{fsb_link}</code>"
 
     try:
-        saved_msg = await client.send_video(
-            chat_id=CHANNEL_ID,
-            video=local_filename,
-            caption=caption,
-            has_spoiler=True
-        )
+        saved_msg = await client.send_video(chat_id=CHANNEL_ID, video=local_filename, caption=caption, has_spoiler=True)
         
-        # 1. Share link with FileShareBot
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.id))
-        
-        # 2. Save original Terabox URL to cache so we never have to download this again
         cursor.execute('INSERT INTO terabox_cache (terabox_url, message_id) VALUES (?, ?)', (clean_url, saved_msg.id))
-        
         conn.commit()
 
-        await anim_msg.edit_text("<blockquote>✅ **Finalizing Delivery...**\n[■■■■■] 100%</blockquote>")
+        await anim_msg.edit_text("<blockquote><code>[✅] Transfer Complete</code>\n<code>[██████████] 100%</code></blockquote>")
         
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download More", callback_data="terabox_start")]])
-        
-        await client.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=CHANNEL_ID,
-            message_id=saved_msg.id,
-            caption="\u200B", 
-            reply_markup=keyboard
-        )
+        await client.copy_message(chat_id=message.chat.id, from_chat_id=CHANNEL_ID, message_id=saved_msg.id, caption="\u200B", reply_markup=keyboard)
 
     except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ **Upload error:**\n{e}</blockquote>")
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
     finally:
-        if os.path.exists(local_filename):
-            os.remove(local_filename)
-        
+        if os.path.exists(local_filename): os.remove(local_filename)
         await safe_delete(anim_msg)
 
 if __name__ == "__main__":
