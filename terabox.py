@@ -64,9 +64,15 @@ async def process_terabox_link(client, message):
     raw_text = message.text
     text = raw_text.lower()
     
-    if "terabox" not in text and "1024tera" not in text:
+    # --- THE FIX: Expanded Terabox Domain Whitelist ---
+    valid_domains = [
+        "terabox", "1024tera", "terashare", "4funbox", 
+        "mirrobox", "nephobox", "freeterabox", "momerybox", "teraboxapp"
+    ]
+    
+    if not any(domain in text for domain in valid_domains):
         await safe_delete(message)
-        err = await message.reply_text("<blockquote>⚠️ <b>Invalid protocol.</b>\nRequires a Terabox URL.</blockquote>")
+        err = await message.reply_text("<blockquote>⚠️ <b>Invalid protocol.</b>\nRequires a valid Terabox family URL.</blockquote>")
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
         return
 
@@ -90,7 +96,6 @@ async def process_terabox_link(client, message):
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, msg_id))
         conn.commit()
         
-        # Fetch the original message from the private channel to get the video metadata
         orig_msg = await client.get_messages(CHANNEL_ID, msg_id)
         vid = orig_msg.video or orig_msg.document
         
@@ -153,7 +158,6 @@ async def process_terabox_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    # Convert duration "01:16" to seconds for Telegram
     dur_parts = duration_str.split(":")
     dur_secs = 0
     if len(dur_parts) == 2: dur_secs = int(dur_parts[0]) * 60 + int(dur_parts[1])
@@ -170,14 +174,12 @@ async def process_terabox_link(client, message):
     
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Download Thumbnail
             if thumb_url:
                 async with session.get(thumb_url) as t_resp:
                     if t_resp.status == 200:
                         async with aiofiles.open(thumb_path, mode='wb') as f:
                             await f.write(await t_resp.read())
             
-            # Download Video
             async with session.get(video_url) as resp:
                 async with aiofiles.open(local_filename, mode='wb') as f:
                     while True:
@@ -197,7 +199,6 @@ async def process_terabox_link(client, message):
     channel_caption = f"🔗 **Access Link:**\n<code>{fsb_link}</code>"
 
     try:
-        # THE FIX: supports_streaming=True converts it from a File to a playable Video!
         saved_msg = await client.send_video(
             chat_id=CHANNEL_ID, 
             video=local_filename, 
@@ -215,7 +216,6 @@ async def process_terabox_link(client, message):
 
         await anim_msg.edit_text("<blockquote><code>[✅] Transfer Complete</code>\n<code>[██████████] 100%</code></blockquote>")
         
-        # Format the beautiful User UI matching your screenshot
         user_caption = (
             f"🎬 <b>{file_name}</b>\n\n"
             f"⏱ <b>Duration:</b> {duration_str}\n"
@@ -236,7 +236,6 @@ async def process_terabox_link(client, message):
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
     finally:
-        # Clean up files from Render
         if os.path.exists(local_filename): os.remove(local_filename)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
         await safe_delete(anim_msg)
