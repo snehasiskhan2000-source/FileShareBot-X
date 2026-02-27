@@ -17,7 +17,8 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-100YOUR_CHANNEL_ID_HERE"))
 XAPI_KEY = os.getenv("XAPI_KEY", "YOUR_XAPIVERSE_KEY")
 FILESHARE_BOT_USERNAME = os.getenv("FILESHARE_BOT_USERNAME", "FSB69_BOT") 
 
-TEMP_MSG_DELETE_TIME = 120 
+TEMP_MSG_DELETE_TIME = 120    # 2 mins for bot messages
+FILE_DELETE_TIME = 3600       # 1 hour for the actual video
 
 logging.basicConfig(level=logging.INFO)
 
@@ -89,21 +90,43 @@ async def process_terabox_link(client, message):
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, msg_id))
         conn.commit()
         
+        # Fetch the original message from the private channel to get the video metadata
+        orig_msg = await client.get_messages(CHANNEL_ID, msg_id)
+        vid = orig_msg.video or orig_msg.document
+        
+        file_name = getattr(vid, "file_name", "terabox_video.mp4")
+        dur_secs = getattr(vid, "duration", 0)
+        dur_str = f"{dur_secs // 60:02d}:{dur_secs % 60:02d}" if dur_secs else "Unknown"
+        file_size = getattr(vid, "file_size", 0)
+        size_mb = f"{file_size / (1024 * 1024):.2f} MB" if file_size else "Unknown"
+
+        user_caption = (
+            f"🎬 <b>{file_name}</b>\n\n"
+            f"⏱ <b>Duration:</b> {dur_str}\n"
+            f"📦 <b>Size:</b> {size_mb}\n\n"
+            f"⚠️ <b>Note:</b> Video will be auto-deleted after {FILE_DELETE_TIME // 3600} hour(s)"
+        )
+
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download More", callback_data="terabox_start")]])
-        await client.copy_message(chat_id=message.chat.id, from_chat_id=CHANNEL_ID, message_id=msg_id, caption="\u200B", reply_markup=keyboard)
+        sent_vid = await client.copy_message(
+            chat_id=message.chat.id, 
+            from_chat_id=CHANNEL_ID, 
+            message_id=msg_id, 
+            caption=user_caption, 
+            reply_markup=keyboard
+        )
+        asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
         return 
     # ==================================================================
 
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
-    
-    # PREMIUM DOWNLOADING ANIMATION
     anim_msg = await message.reply_text("<blockquote><code>[📡] Pinging xAPIVERSE servers...</code></blockquote>")
 
     api_url = 'https://xapiverse.com/api/terabox-pro'
     headers = {'Content-Type': 'application/json', 'xAPIverse-Key': XAPI_KEY}
     payload = {"url": clean_url} 
     
-    video_url, file_name = None, "terabox_video.mp4" 
+    video_url, thumb_url, file_name, duration_str, size_fmt = None, None, "terabox_video.mp4", "Unknown", "Unknown"
     timeout = aiohttp.ClientTimeout(total=3600) 
     
     try:
@@ -113,7 +136,10 @@ async def process_terabox_link(client, message):
                 if data.get("status") == "success" and data.get("list"):
                     file_data = data["list"][0]
                     video_url = file_data.get("fast_download_link") or file_data.get("download_link")
+                    thumb_url = file_data.get("thumbnail")
                     file_name = file_data.get("name", "terabox_video.mp4")
+                    duration_str = file_data.get("duration", "00:00")
+                    size_fmt = file_data.get("size_formatted", "Unknown")
                 else:
                     raise Exception(data.get("message", "API returned an empty list."))
                     
@@ -127,6 +153,12 @@ async def process_terabox_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
+    # Convert duration "01:16" to seconds for Telegram
+    dur_parts = duration_str.split(":")
+    dur_secs = 0
+    if len(dur_parts) == 2: dur_secs = int(dur_parts[0]) * 60 + int(dur_parts[1])
+    elif len(dur_parts) == 3: dur_secs = int(dur_parts[0]) * 3600 + int(dur_parts[1]) * 60 + int(dur_parts[2])
+
     await anim_msg.edit_text("<blockquote><code>[🔓] Bypassing Terabox security...</code></blockquote>")
     await asyncio.sleep(0.5)
     await anim_msg.edit_text("<blockquote><code>[📥] Downloading to Render...</code>\n<code>[████░░░░░░] 40%</code></blockquote>")
@@ -134,9 +166,18 @@ async def process_terabox_link(client, message):
     
     os.makedirs("downloads", exist_ok=True)
     local_filename = f"downloads/{secrets.token_hex(4)}_{file_name}"
+    thumb_path = f"downloads/thumb_{secrets.token_hex(4)}.jpg" if thumb_url else None
     
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Download Thumbnail
+            if thumb_url:
+                async with session.get(thumb_url) as t_resp:
+                    if t_resp.status == 200:
+                        async with aiofiles.open(thumb_path, mode='wb') as f:
+                            await f.write(await t_resp.read())
+            
+            # Download Video
             async with session.get(video_url) as resp:
                 async with aiofiles.open(local_filename, mode='wb') as f:
                     while True:
@@ -153,10 +194,20 @@ async def process_terabox_link(client, message):
 
     link_id = secrets.token_urlsafe(8)
     fsb_link = f"https://t.me/{FILESHARE_BOT_USERNAME}?start={link_id}"
-    caption = f"🔗 **Access Link:**\n<code>{fsb_link}</code>"
+    channel_caption = f"🔗 **Access Link:**\n<code>{fsb_link}</code>"
 
     try:
-        saved_msg = await client.send_video(chat_id=CHANNEL_ID, video=local_filename, caption=caption, has_spoiler=True)
+        # THE FIX: supports_streaming=True converts it from a File to a playable Video!
+        saved_msg = await client.send_video(
+            chat_id=CHANNEL_ID, 
+            video=local_filename, 
+            caption=channel_caption, 
+            has_spoiler=True,
+            duration=dur_secs,
+            thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+            file_name=file_name,
+            supports_streaming=True
+        )
         
         cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.id))
         cursor.execute('INSERT INTO terabox_cache (terabox_url, message_id) VALUES (?, ?)', (clean_url, saved_msg.id))
@@ -164,13 +215,30 @@ async def process_terabox_link(client, message):
 
         await anim_msg.edit_text("<blockquote><code>[✅] Transfer Complete</code>\n<code>[██████████] 100%</code></blockquote>")
         
+        # Format the beautiful User UI matching your screenshot
+        user_caption = (
+            f"🎬 <b>{file_name}</b>\n\n"
+            f"⏱ <b>Duration:</b> {duration_str}\n"
+            f"📦 <b>Size:</b> {size_fmt}\n\n"
+            f"⚠️ <b>Note:</b> Video will be auto-deleted after {FILE_DELETE_TIME // 3600} hour(s)"
+        )
+        
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download More", callback_data="terabox_start")]])
-        await client.copy_message(chat_id=message.chat.id, from_chat_id=CHANNEL_ID, message_id=saved_msg.id, caption="\u200B", reply_markup=keyboard)
+        sent_vid = await client.copy_message(
+            chat_id=message.chat.id, 
+            from_chat_id=CHANNEL_ID, 
+            message_id=saved_msg.id, 
+            caption=user_caption, 
+            reply_markup=keyboard
+        )
+        asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
 
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
     finally:
+        # Clean up files from Render
         if os.path.exists(local_filename): os.remove(local_filename)
+        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
         await safe_delete(anim_msg)
 
 if __name__ == "__main__":
