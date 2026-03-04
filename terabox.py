@@ -30,6 +30,9 @@ app = Client(
     parse_mode=enums.ParseMode.HTML
 )
 
+# --- THE FIX: Dictionary to track and delete welcome messages ---
+active_welcome_msgs = {}
+
 # ================= Database Setup =================
 conn = sqlite3.connect('bot_database.db', check_same_thread=False)
 cursor = conn.cursor()
@@ -52,18 +55,29 @@ async def delete_after(client, chat_id, message_id, delay):
 async def cmd_start(client, message):
     await safe_delete(message)
     msg = await message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Our servers will handle the rest.</i></blockquote>")
+    active_welcome_msgs[message.chat.id] = msg.id # Track message
     asyncio.create_task(delete_after(client, msg.chat.id, msg.id, TEMP_MSG_DELETE_TIME))
 
 @app.on_callback_query(filters.regex("terabox_start"))
 async def callback_download_more(client, callback_query):
-    await callback_query.message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Ready for the next payload.</i></blockquote>")
+    msg = await callback_query.message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Ready for the next payload.</i></blockquote>")
+    active_welcome_msgs[callback_query.message.chat.id] = msg.id # Track message
     await callback_query.answer()
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start"]))
 async def process_terabox_link(client, message):
+    chat_id = message.chat.id
     raw_text = message.text
     text = raw_text.lower()
     
+    # --- THE FIX: Clean up the old welcome message immediately ---
+    if chat_id in active_welcome_msgs:
+        try:
+            await client.delete_messages(chat_id, active_welcome_msgs[chat_id])
+            del active_welcome_msgs[chat_id]
+        except Exception:
+            pass
+            
     valid_domains = [
         "terabox", "1024tera", "1024terabox", "terashare", "4funbox", 
         "mirrobox", "nephobox", "freeterabox", "momerybox", "teraboxapp"
@@ -126,7 +140,7 @@ async def process_terabox_link(client, message):
 
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
     
-    # --- Crystal Clean Animation Sequence ---
+    # Crystal Clean Animation Sequence
     anim_msg = await message.reply_text("<blockquote>✨ <b>Transmitting Link</b> 🙌\n<i>Ready for payload.</i></blockquote>")
     await asyncio.sleep(0.4)
     await anim_msg.edit_text("<blockquote>✨ <b>Transmitting Link</b> 🙌\n<i>Ready for payload..</i></blockquote>")
@@ -178,8 +192,10 @@ async def process_terabox_link(client, message):
     thumb_path = f"downloads/thumb_{secrets.token_hex(4)}.jpg" if thumb_url else None
     
     try:
+        # Added extra Accept headers to trick strict servers
         dl_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
         }
         
         async with aiohttp.ClientSession(timeout=timeout, headers=dl_headers) as session:
@@ -202,9 +218,18 @@ async def process_terabox_link(client, message):
                         chunk = await resp.content.read(2 * 1024 * 1024) 
                         if not chunk: break
                         await f.write(chunk)
+                        
+        # --- THE FIX: Physical File Verification ---
+        if os.path.exists(local_filename):
+            file_size_bytes = os.path.getsize(local_filename)
+            # If the downloaded file is less than 100KB, it is a fake/error file
+            if file_size_bytes < 100 * 1024:
+                raise Exception("Terabox API provided an expired or restricted file link.")
+                
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Download Interrupted:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
+        if os.path.exists(local_filename): os.remove(local_filename)
         return
 
     await anim_msg.edit_text("<blockquote><code>[📤] Uploading...</code></blockquote>")
@@ -259,6 +284,9 @@ async def process_terabox_link(client, message):
             caption=user_caption, 
             reply_markup=keyboard
         )
+        # Ensure the bot tracks this new "Download More" button prompt if we need to auto-delete it later
+        active_welcome_msgs[message.chat.id] = sent_vid.id
+        
         asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
 
     except Exception as e:
