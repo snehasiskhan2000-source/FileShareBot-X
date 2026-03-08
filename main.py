@@ -158,7 +158,7 @@ async def cmd_admin(client, message):
     ])
     await message.reply_text("<blockquote>⚙️ <b>Admin Root Access</b>\nSelect an override command:</blockquote>", reply_markup=keyboard)
 
-# ================= NEW: Direct URL Download Logic =================
+# ================= Direct URL Download Logic =================
 @app.on_message(filters.command("download") & filters.private)
 async def cmd_download(client, message):
     await safe_delete(message)
@@ -172,7 +172,6 @@ async def cmd_download(client, message):
 
     url = args[1]
     
-    # Simple validation to check if it's a URL
     if not re.match(r'^https?://', url):
         err = await message.reply_text("<blockquote>❌ <b>Invalid URL:</b>\nPlease provide a valid HTTP/HTTPS direct link.</blockquote>")
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
@@ -181,17 +180,9 @@ async def cmd_download(client, message):
     anim_msg = await message.reply_text("<blockquote><code>[📥] Downloading...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
 
-    # 1. Download Phase
     os.makedirs("downloads", exist_ok=True)
-    
-    # Try to extract a filename from the URL, or use a default
-    parsed_url = urllib.parse.urlparse(url)
-    filename = os.path.basename(parsed_url.path)
-    if not filename or "." not in filename:
-        filename = "downloaded_file.bin"
-        
-    local_filename = f"downloads/{secrets.token_hex(4)}_{filename}"
     timeout = aiohttp.ClientTimeout(total=3600)
+    local_filename = None
 
     try:
         dl_headers = {
@@ -202,39 +193,64 @@ async def cmd_download(client, message):
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status} - Access Denied by remote server.")
                 
-                # Try to get the real filename from headers if the server provides it
+                content_type = resp.headers.get('Content-Type', '')
+                
+                # 1. Try to get the real filename from headers first
                 cd = resp.headers.get('Content-Disposition')
+                filename = ""
                 if cd and 'filename=' in cd:
-                    header_filename = re.findall("filename=(.+)", cd)
-                    if header_filename:
-                        filename = header_filename[0].strip('\"\'')
-                        # Update local path with real extension
-                        local_filename = f"downloads/{secrets.token_hex(4)}_{filename}"
+                    match = re.search(r'filename="?([^";]+)"?', cd)
+                    if match:
+                        filename = match.group(1)
+
+                # 2. Fallback to extracting from the URL
+                if not filename:
+                    parsed_url = urllib.parse.urlparse(url)
+                    filename = os.path.basename(parsed_url.path)
+                
+                # 3. Clean the filename (removes %20 and trailing query parameters)
+                filename = urllib.parse.unquote(filename)
+                filename = filename.split('?')[0]
+                
+                if not filename:
+                    filename = "downloaded_video"
+
+                # 4. Strict Video Enforcement
+                file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
+                video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts']
+                
+                is_video_content = 'video/' in content_type.lower()
+                
+                # If the server says it's a video but the extension is missing or weird, enforce .mp4
+                if is_video_content and file_ext not in video_extensions:
+                    filename += ".mp4"
+                    file_ext = "mp4"
+
+                local_filename = f"downloads/{secrets.token_hex(4)}_{filename}"
 
                 async with aiofiles.open(local_filename, mode='wb') as f:
                     while True:
                         chunk = await resp.content.read(2 * 1024 * 1024) 
                         if not chunk: break
                         await f.write(chunk)
+                        
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    # 2. Upload Phase
+    # Upload Phase
     await anim_msg.edit_text("<blockquote><code>[📤] Uploading...</code></blockquote>")
-    await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
 
     link_id = secrets.token_urlsafe(8)
     bot_info = await client.get_me()
     share_link = f"https://t.me/{bot_info.username}?start={link_id}"
     
     channel_caption = f"<blockquote>🔗 <b>Secure Access Link:</b>\n<code>{share_link}</code></blockquote>"
-    file_ext = filename.split('.')[-1].lower() if '.' in filename else 'bin'
-    video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv']
 
     try:
-        if file_ext in video_extensions:
+        if is_video_content or file_ext in video_extensions:
+            await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
             saved_msg = await client.send_video(
                 chat_id=CHANNEL_ID, 
                 video=local_filename, 
@@ -244,6 +260,7 @@ async def cmd_download(client, message):
                 supports_streaming=True
             )
         else:
+            await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
             saved_msg = await client.send_document(
                 chat_id=CHANNEL_ID, 
                 document=local_filename, 
@@ -265,7 +282,7 @@ async def cmd_download(client, message):
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
     finally:
-        if os.path.exists(local_filename): 
+        if local_filename and os.path.exists(local_filename): 
             os.remove(local_filename)
 
 # ================= Hidden Upload Logic =================
