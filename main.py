@@ -212,19 +212,26 @@ async def cmd_download(client, message):
                 filename = urllib.parse.unquote(filename)
                 filename = filename.split('?')[0]
                 
-                if not filename:
-                    filename = "downloaded_video"
+                # 4. Strict Video Enforcement (Forcing Telegram Video Compatibility)
+                if '.' in filename:
+                    base_name, file_ext = filename.rsplit('.', 1)
+                    file_ext = file_ext.lower()
+                else:
+                    base_name, file_ext = filename, ''
 
-                # 4. Strict Video Enforcement
-                file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
-                video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts']
-                
                 is_video_content = 'video/' in content_type.lower()
+                all_video_exts = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts']
+                telegram_friendly_exts = ['mp4', 'mkv', 'mov', 'webm']
                 
-                # If the server says it's a video but the extension is missing or weird, enforce .mp4
-                if is_video_content and file_ext not in video_extensions:
-                    filename += ".mp4"
-                    file_ext = "mp4"
+                # If it's a video, but not a Telegram-friendly format, FORCE .mp4
+                if is_video_content or file_ext in all_video_exts:
+                    if file_ext not in telegram_friendly_exts:
+                        filename = f"{base_name}.mp4"
+                        file_ext = "mp4"
+                elif not file_ext:
+                    # If there's no extension at all, default to .bin
+                    filename = f"{base_name}.bin"
+                    file_ext = "bin"
 
                 local_filename = f"downloads/{secrets.token_hex(4)}_{filename}"
 
@@ -249,7 +256,7 @@ async def cmd_download(client, message):
     channel_caption = f"<blockquote>🔗 <b>Secure Access Link:</b>\n<code>{share_link}</code></blockquote>"
 
     try:
-        if is_video_content or file_ext in video_extensions:
+        if is_video_content or file_ext in telegram_friendly_exts:
             await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
             saved_msg = await client.send_video(
                 chat_id=CHANNEL_ID, 
