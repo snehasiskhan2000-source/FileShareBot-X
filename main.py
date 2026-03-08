@@ -81,9 +81,11 @@ async def auto_delete_batch_task(client: Client, chat_id: int, message_ids: list
 # ================= Custom Filters =================
 async def is_upload_state(_, __, message): return user_states.get(message.from_user.id) == "upload"
 async def is_delete_state(_, __, message): return user_states.get(message.from_user.id) == "delete"
+async def is_download_state(_, __, message): return user_states.get(message.from_user.id) == "download_link"
 
 upload_filter = filters.create(is_upload_state)
 delete_filter = filters.create(is_delete_state)
+download_filter = filters.create(is_download_state)
 
 # ================= Commands =================
 @app.on_message(filters.command("cancel") & filters.private)
@@ -158,20 +160,25 @@ async def cmd_admin(client, message):
     ])
     await message.reply_text("<blockquote>⚙️ <b>Admin Root Access</b>\nSelect an override command:</blockquote>", reply_markup=keyboard)
 
-# ================= Direct URL Download Logic =================
+# ================= NEW: Interactive Download Flow =================
 @app.on_message(filters.command("download") & filters.private)
 async def cmd_download(client, message):
     await safe_delete(message)
     if message.from_user.id != ADMIN_ID: return 
-
-    args = message.command
-    if len(args) < 2:
-        err = await message.reply_text("<blockquote>⚠️ <b>Syntax Error:</b>\nUsage: <code>/download &lt;Direct_Download_Link&gt;</code></blockquote>")
-        asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
-        return
-
-    url = args[1]
     
+    await set_state(message.from_user.id, "download_link")
+    msg = await message.reply_text("<blockquote>✨ <b>Direct Downloader</b>\nSend Me Any Direct Download Link 👋\n💡 <i>Type /cancel to abort.</i></blockquote>")
+    await track_msg(message.from_user.id, msg.id)
+
+@app.on_message(download_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download"]) & filters.private)
+async def process_download_link(client, message):
+    if message.from_user.id != ADMIN_ID: return
+    
+    url = message.text.strip()
+    await safe_delete(message)
+    await wipe_tracked_msgs(client, message.chat.id, message.from_user.id)
+    await clear_state(message.from_user.id)
+
     if not re.match(r'^https?://', url):
         err = await message.reply_text("<blockquote>❌ <b>Invalid URL:</b>\nPlease provide a valid HTTP/HTTPS direct link.</blockquote>")
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
@@ -191,28 +198,22 @@ async def cmd_download(client, message):
         async with aiohttp.ClientSession(timeout=timeout, headers=dl_headers) as session:
             async with session.get(url, allow_redirects=True) as resp:
                 if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status} - Access Denied by remote server.")
+                    raise Exception(f"HTTP {resp.status} - Access Denied.")
                 
                 content_type = resp.headers.get('Content-Type', '')
                 
-                # 1. Try to get the real filename from headers first
                 cd = resp.headers.get('Content-Disposition')
                 filename = ""
                 if cd and 'filename=' in cd:
                     match = re.search(r'filename="?([^";]+)"?', cd)
-                    if match:
-                        filename = match.group(1)
+                    if match: filename = match.group(1)
 
-                # 2. Fallback to extracting from the URL
                 if not filename:
                     parsed_url = urllib.parse.urlparse(url)
                     filename = os.path.basename(parsed_url.path)
                 
-                # 3. Clean the filename
-                filename = urllib.parse.unquote(filename)
-                filename = filename.split('?')[0]
+                filename = urllib.parse.unquote(filename).split('?')[0]
                 
-                # 4. Strict Video Enforcement (Force .mp4 & Dimensions)
                 if '.' in filename:
                     base_name, file_ext = filename.rsplit('.', 1)
                     file_ext = file_ext.lower()
@@ -222,7 +223,7 @@ async def cmd_download(client, message):
                 is_video_content = 'video/' in content_type.lower()
                 video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts', 'm4v']
                 
-                # If it's a video, forcefully rename it to .mp4 so Telegram stops complaining
+                # Enforce .mp4 to give it the highest chance of showing as a video
                 if is_video_content or file_ext in video_extensions:
                     filename = f"{base_name}.mp4"
                     file_ext = "mp4"
@@ -238,15 +239,13 @@ async def cmd_download(client, message):
                         if not chunk: break
                         await f.write(chunk)
                         
-                # --- THE 0-BYTE TRAP ---
                 if os.path.getsize(local_filename) == 0:
-                    raise Exception("Remote server returned 0 Bytes. The direct link has expired or blocked the download!")
+                    raise Exception("Remote server returned 0 Bytes. Link expired!")
                         
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
-        if local_filename and os.path.exists(local_filename): 
-            os.remove(local_filename)
+        if local_filename and os.path.exists(local_filename): os.remove(local_filename)
         return
 
     # Upload Phase
@@ -255,7 +254,6 @@ async def cmd_download(client, message):
     link_id = secrets.token_urlsafe(8)
     bot_info = await client.get_me()
     share_link = f"https://t.me/{bot_info.username}?start={link_id}"
-    
     channel_caption = f"<blockquote>🔗 <b>Secure Access Link:</b>\n<code>{share_link}</code></blockquote>"
 
     try:
@@ -294,8 +292,7 @@ async def cmd_download(client, message):
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
     finally:
-        if local_filename and os.path.exists(local_filename): 
-            os.remove(local_filename)
+        if local_filename and os.path.exists(local_filename): os.remove(local_filename)
 
 # ================= Hidden Upload Logic =================
 @app.on_message(upload_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download"]) & filters.private)
@@ -428,4 +425,4 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
-            
+    
