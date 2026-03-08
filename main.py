@@ -208,11 +208,11 @@ async def cmd_download(client, message):
                     parsed_url = urllib.parse.urlparse(url)
                     filename = os.path.basename(parsed_url.path)
                 
-                # 3. Clean the filename (removes %20 and trailing query parameters)
+                # 3. Clean the filename
                 filename = urllib.parse.unquote(filename)
                 filename = filename.split('?')[0]
                 
-                # 4. Strict Video Enforcement (Forcing Telegram Video Compatibility)
+                # 4. Determine extension without faking it
                 if '.' in filename:
                     base_name, file_ext = filename.rsplit('.', 1)
                     file_ext = file_ext.lower()
@@ -220,16 +220,12 @@ async def cmd_download(client, message):
                     base_name, file_ext = filename, ''
 
                 is_video_content = 'video/' in content_type.lower()
-                all_video_exts = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts']
-                telegram_friendly_exts = ['mp4', 'mkv', 'mov', 'webm']
+                video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts', 'm4v']
                 
-                # If it's a video, but not a Telegram-friendly format, FORCE .mp4
-                if is_video_content or file_ext in all_video_exts:
-                    if file_ext not in telegram_friendly_exts:
-                        filename = f"{base_name}.mp4"
-                        file_ext = "mp4"
+                if is_video_content and not file_ext:
+                    filename = f"{base_name}.mp4"
+                    file_ext = "mp4"
                 elif not file_ext:
-                    # If there's no extension at all, default to .bin
                     filename = f"{base_name}.bin"
                     file_ext = "bin"
 
@@ -256,14 +252,17 @@ async def cmd_download(client, message):
     channel_caption = f"<blockquote>🔗 <b>Secure Access Link:</b>\n<code>{share_link}</code></blockquote>"
 
     try:
-        if is_video_content or file_ext in telegram_friendly_exts:
+        if is_video_content or file_ext in video_extensions:
             await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
+            # --- THE MAGIC TRICK: FORCING DIMENSIONS ---
             saved_msg = await client.send_video(
                 chat_id=CHANNEL_ID, 
                 video=local_filename, 
                 caption=channel_caption, 
                 has_spoiler=True,
                 file_name=filename,
+                width=1280,   
+                height=720,   
                 supports_streaming=True
             )
         else:
@@ -423,4 +422,4 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
-    
+                
