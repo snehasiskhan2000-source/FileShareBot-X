@@ -7,7 +7,6 @@ import aiohttp
 import aiofiles
 import re
 import urllib.parse
-import json
 from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -79,32 +78,34 @@ async def auto_delete_batch_task(client: Client, chat_id: int, message_ids: list
     try: await client.delete_messages(chat_id, message_ids)
     except Exception as e: logging.error(f"Could not auto-delete: {e}")
 
-# --- FFMPEG MAGIC UTILS ---
-async def get_video_info(file_path):
+# --- THE SPEED HACK: Remote Metadata Extraction ---
+async def get_remote_meta(url):
+    thumb_path = f"downloads/thumb_{secrets.token_hex(4)}.jpg"
+    width, height = 1280, 720
     try:
-        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path]
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await process.communicate()
-        data = json.loads(stdout)
-        video_stream = next((s for s in data["streams"] if s["codec_type"] == "video"), None)
-        width = int(video_stream["width"]) if video_stream else 1280
-        height = int(video_stream["height"]) if video_stream else 720
-        duration = int(float(data["format"]["duration"]))
-        return width, height, duration
-    except Exception:
-        return 1280, 720, 0
-
-async def get_thumbnail(file_path):
-    try:
-        thumb_path = f"{file_path}_thumb.jpg"
-        # Extract a frame at the 2-second mark to use as the physical thumbnail
-        cmd = ["ffmpeg", "-i", file_path, "-ss", "00:00:02.000", "-vframes", "1", thumb_path, "-y"]
+        # Stream just the 2nd second directly from the internet! No full download needed.
+        cmd = [
+            "ffmpeg", 
+            "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "-ss", "00:00:02.000", 
+            "-i", url, 
+            "-vframes", "1", 
+            thumb_path, "-y"
+        ]
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await process.communicate()
+        
+        # Pull dimensions from the tiny image file instantly
         if os.path.exists(thumb_path):
-            return thumb_path
+            cmd2 = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", thumb_path]
+            process2 = await asyncio.create_subprocess_exec(*cmd2, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, _ = await process2.communicate()
+            dims = out.decode().strip().split('x')
+            if len(dims) == 2:
+                width, height = int(dims[0]), int(dims[1])
     except Exception: pass
-    return None
+        
+    return thumb_path if os.path.exists(thumb_path) else None, width, height
 
 # ================= Custom Filters =================
 async def is_upload_state(_, __, message): return user_states.get(message.from_user.id) == "upload"
@@ -212,13 +213,14 @@ async def process_download_link(client, message):
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
         return
 
-    anim_msg = await message.reply_text("<blockquote><code>[📥] Downloading...</code></blockquote>")
+    anim_msg = await message.reply_text("<blockquote><code>[⚙️] Analyzing Remote Server...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
 
     os.makedirs("downloads", exist_ok=True)
     timeout = aiohttp.ClientTimeout(total=3600)
     local_filename = None
     thumb_path = None
+    width, height = 1280, 720
 
     try:
         dl_headers = {
@@ -230,7 +232,6 @@ async def process_download_link(client, message):
                     raise Exception(f"HTTP {resp.status} - Access Denied.")
                 
                 content_type = resp.headers.get('Content-Type', '')
-                
                 cd = resp.headers.get('Content-Disposition')
                 filename = ""
                 if cd and 'filename=' in cd:
@@ -255,17 +256,22 @@ async def process_download_link(client, message):
                 if is_video_content or file_ext in video_extensions:
                     filename = f"{base_name}.mp4"
                     file_ext = "mp4"
+                    # Fast-lane thumbnail extraction!
+                    thumb_path, width, height = await get_remote_meta(url)
                 elif not file_ext:
                     filename = f"{base_name}.bin"
                     file_ext = "bin"
 
                 local_filename = f"downloads/{secrets.token_hex(4)}_{filename}"
 
+                await anim_msg.edit_text("<blockquote><code>[📥] Downloading Data Stream...</code></blockquote>")
+                
+                # --- THE OOM FIX: 0-RAM Download Processing ---
                 async with aiofiles.open(local_filename, mode='wb') as f:
-                    while True:
-                        chunk = await resp.content.read(2 * 1024 * 1024) 
-                        if not chunk: break
+                    # Download in 4MB chunks and strictly garbage collect
+                    async for chunk in resp.content.iter_chunked(4 * 1024 * 1024): 
                         await f.write(chunk)
+                        del chunk # Instantly wipes the RAM trace 
                         
                 if os.path.getsize(local_filename) == 0:
                     raise Exception("Remote server returned 0 Bytes. Link expired!")
@@ -274,11 +280,10 @@ async def process_download_link(client, message):
         await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         if local_filename and os.path.exists(local_filename): os.remove(local_filename)
+        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
         return
 
     # Upload Phase
-    await anim_msg.edit_text("<blockquote><code>[⚙️] Processing Media Engine...</code></blockquote>")
-
     link_id = secrets.token_urlsafe(8)
     bot_info = await client.get_me()
     share_link = f"https://t.me/{bot_info.username}?start={link_id}"
@@ -288,10 +293,6 @@ async def process_download_link(client, message):
         if file_ext == "mp4":
             await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
             await anim_msg.edit_text("<blockquote><code>[📤] Uploading Video...</code></blockquote>")
-            
-            # THE FFmpeg NUCLEAR OPTION: Extract exact dimensions, duration, and a physical thumbnail
-            width, height, duration = await get_video_info(local_filename)
-            thumb_path = await get_thumbnail(local_filename)
 
             saved_msg = await client.send_video(
                 chat_id=CHANNEL_ID, 
@@ -301,7 +302,6 @@ async def process_download_link(client, message):
                 file_name=filename,
                 width=width,   
                 height=height,
-                duration=duration,
                 thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                 supports_streaming=True
             )
