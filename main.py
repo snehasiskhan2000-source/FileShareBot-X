@@ -8,6 +8,7 @@ import aiofiles
 import re
 import urllib.parse
 import json
+import threading
 import yt_dlp
 from aiohttp import web
 from pyrogram import Client, filters, enums
@@ -30,6 +31,7 @@ logging.basicConfig(level=logging.INFO)
 
 app = Client(
     "file_share_bot",
+    in_memory=True,  # <-- 100% prevents SQLite lock conflicts with terabox.py
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
@@ -218,7 +220,6 @@ async def cmd_admin(client, message):
 
 # ================= UNIVERSAL STREAM & DOWNLOAD LOGIC =================
 
-# --- HELPER: Threaded yt-dlp downloader so it doesn't freeze the bot ---
 def sync_yt_dlp_download(media_url):
     os.makedirs("downloads", exist_ok=True)
     ydl_opts = {
@@ -262,7 +263,6 @@ async def process_stream_link(client, message):
         if ".mp4" in request.url or ".m3u8" in request.url:
             media_links.add(request.url)
 
-    # 1. Playwright Sniffing Phase (Async to avoid freezing the bot)
     try:
         await anim_msg.edit_text("<blockquote><code>[🔎] Sniffing network for streams...</code></blockquote>")
         async with async_playwright() as p:
@@ -294,10 +294,9 @@ async def process_stream_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    target_link = list(media_links)[0] # Grab the first valid stream found
+    target_link = list(media_links)[0] 
     await anim_msg.edit_text(f"<blockquote><code>[📥] Found {len(media_links)} stream(s). Downloading via yt-dlp...</code></blockquote>")
 
-    # 2. yt-dlp Download Phase (Run in background thread to keep bot responsive)
     local_filename = None
     thumb_path = None
     try:
@@ -309,7 +308,6 @@ async def process_stream_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    # 3. Vault Upload Phase (Exact same premium logic as /download)
     await anim_msg.edit_text("<blockquote><code>[⚙️] Processing Media Engine...</code></blockquote>")
 
     filename = os.path.basename(local_filename)
@@ -609,23 +607,25 @@ async def process_delete_link(client, message):
         await clear_state(message.from_user.id)
 
 # ================= Render Keep-Alive Server =================
-async def handle_ping(request): return web.Response(text="Bot is running smoothly on Pyrogram!")
-async def web_server():
+async def handle_ping(request): 
+    return web.Response(text="Bot is running smoothly on Pyrogram!")
+
+def start_web_server():
     server = web.Application()
     server.router.add_get('/', handle_ping)
     runner = web.AppRunner(server)
-    await runner.setup()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-
-async def main():
-    print("Starting Web Server...")
-    asyncio.create_task(web_server())
-    print("Starting Pyrogram Bot...")
-    await app.start()
-    from pyrogram import idle
-    await idle()
-    await app.stop()
+    loop.run_until_complete(site.start())
+    loop.run_forever()
 
 if __name__ == "__main__":
-    app.run(main())
+    print("Starting Web Server in background...")
+    # Run the web server in a completely separate daemon thread so it doesn't block the bot
+    threading.Thread(target=start_web_server, daemon=True).start()
+    
+    print("Starting Pyrogram Bot...")
+    # Let Pyrogram completely control the main thread natively
+    app.run()
