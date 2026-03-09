@@ -7,9 +7,13 @@ import aiohttp
 import aiofiles
 import re
 import urllib.parse
+import json
+import yt_dlp
 from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 # ================= Configuration =================
 API_ID = int(os.getenv("API_ID", "1234567")) 
@@ -78,12 +82,37 @@ async def auto_delete_batch_task(client: Client, chat_id: int, message_ids: list
     try: await client.delete_messages(chat_id, message_ids)
     except Exception as e: logging.error(f"Could not auto-delete: {e}")
 
+# --- FFMPEG MAGIC UTILS ---
+async def get_video_info(file_path):
+    try:
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await process.communicate()
+        data = json.loads(stdout)
+        video_stream = next((s for s in data["streams"] if s["codec_type"] == "video"), None)
+        width = int(video_stream["width"]) if video_stream else 1280
+        height = int(video_stream["height"]) if video_stream else 720
+        duration = int(float(data["format"]["duration"]))
+        return width, height, duration
+    except Exception:
+        return 1280, 720, 0
+
+async def get_thumbnail(file_path):
+    try:
+        thumb_path = f"{file_path}_thumb.jpg"
+        cmd = ["ffmpeg", "-i", file_path, "-ss", "00:00:02.000", "-vframes", "1", thumb_path, "-y"]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await process.communicate()
+        if os.path.exists(thumb_path):
+            return thumb_path
+    except Exception: pass
+    return None
+
 # --- THE SPEED HACK: Remote Metadata Extraction ---
 async def get_remote_meta(url):
     thumb_path = f"downloads/thumb_{secrets.token_hex(4)}.jpg"
     width, height = 1280, 720
     try:
-        # Stream just the 2nd second directly from the internet! No full download needed.
         cmd = [
             "ffmpeg", 
             "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -94,27 +123,25 @@ async def get_remote_meta(url):
         ]
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await process.communicate()
-        
-        # Pull dimensions from the tiny image file instantly
         if os.path.exists(thumb_path):
             cmd2 = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", thumb_path]
             process2 = await asyncio.create_subprocess_exec(*cmd2, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             out, _ = await process2.communicate()
             dims = out.decode().strip().split('x')
-            if len(dims) == 2:
-                width, height = int(dims[0]), int(dims[1])
+            if len(dims) == 2: width, height = int(dims[0]), int(dims[1])
     except Exception: pass
-        
     return thumb_path if os.path.exists(thumb_path) else None, width, height
 
 # ================= Custom Filters =================
 async def is_upload_state(_, __, message): return user_states.get(message.from_user.id) == "upload"
 async def is_delete_state(_, __, message): return user_states.get(message.from_user.id) == "delete"
 async def is_download_state(_, __, message): return user_states.get(message.from_user.id) == "download_link"
+async def is_stream_state(_, __, message): return user_states.get(message.from_user.id) == "stream_link"
 
 upload_filter = filters.create(is_upload_state)
 delete_filter = filters.create(is_delete_state)
 download_filter = filters.create(is_download_state)
+stream_filter = filters.create(is_stream_state)
 
 # ================= Commands =================
 @app.on_message(filters.command("cancel") & filters.private)
@@ -176,7 +203,6 @@ async def cmd_upload(client, message):
     await set_state(message.from_user.id, "upload")
     msg = await message.reply_text("<blockquote>🚀 <b>Upload Uplink Established</b>\n📁 <i>Awaiting payload transfer...</i></blockquote>")
     await track_msg(message.from_user.id, msg.id)
-    asyncio.create_task(delete_after(client, msg.chat.id, msg.id, TEMP_MSG_DELETE_TIME))
 
 @app.on_message(filters.command("admin") & filters.private)
 async def cmd_admin(client, message):
@@ -189,7 +215,150 @@ async def cmd_admin(client, message):
     ])
     await message.reply_text("<blockquote>⚙️ <b>Admin Root Access</b>\nSelect an override command:</blockquote>", reply_markup=keyboard)
 
-# ================= Interactive Download Flow =================
+
+# ================= UNIVERSAL STREAM & DOWNLOAD LOGIC =================
+
+# --- HELPER: Threaded yt-dlp downloader so it doesn't freeze the bot ---
+def sync_yt_dlp_download(media_url):
+    os.makedirs("downloads", exist_ok=True)
+    ydl_opts = {
+        'outtmpl': f'downloads/video_{secrets.token_hex(4)}.%(ext)s',
+        'format': 'best',
+        'quiet': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(media_url, download=True)
+        return ydl.prepare_filename(info)
+
+@app.on_message(filters.command("stream") & filters.private)
+async def cmd_stream(client, message):
+    await safe_delete(message)
+    if message.from_user.id != ADMIN_ID: return 
+    
+    await set_state(message.from_user.id, "stream_link")
+    msg = await message.reply_text("<blockquote>✨ <b>Universal Stream Sniper</b>\nSend Me Any Website Link 👋\n💡 <i>Type /cancel to abort.</i></blockquote>")
+    await track_msg(message.from_user.id, msg.id)
+
+@app.on_message(stream_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download", "stream"]) & filters.private)
+async def process_stream_link(client, message):
+    if message.from_user.id != ADMIN_ID: return
+    
+    url = message.text.strip()
+    await safe_delete(message)
+    await wipe_tracked_msgs(client, message.chat.id, message.from_user.id)
+    await clear_state(message.from_user.id)
+
+    if not re.match(r'^https?://', url):
+        err = await message.reply_text("<blockquote>❌ <b>Invalid URL:</b>\nPlease provide a valid HTTP/HTTPS website link.</blockquote>")
+        asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
+        return
+
+    anim_msg = await message.reply_text("<blockquote><code>[🕵️] Deploying Headless Browser...</code></blockquote>")
+    await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
+
+    media_links = set()
+
+    def handle_request(request):
+        if ".mp4" in request.url or ".m3u8" in request.url:
+            media_links.add(request.url)
+
+    # 1. Playwright Sniffing Phase (Async to avoid freezing the bot)
+    try:
+        await anim_msg.edit_text("<blockquote><code>[🔎] Sniffing network for streams...</code></blockquote>")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True, 
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--disable-gpu'
+                ]
+            )
+            page = await browser.new_page()
+            await stealth_async(page)
+            page.on("request", handle_request)
+            
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(5) 
+            await browser.close()
+            
+    except Exception as e:
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Sniffing Failed:</b>\n<code>{str(e)[:100]}</code></blockquote>")
+        asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
+        return
+
+    if not media_links:
+        await anim_msg.edit_text("<blockquote>⚠️ <b>No Streams Found.</b> No .mp4 or .m3u8 elements located.</blockquote>")
+        asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
+        return
+
+    target_link = list(media_links)[0] # Grab the first valid stream found
+    await anim_msg.edit_text(f"<blockquote><code>[📥] Found {len(media_links)} stream(s). Downloading via yt-dlp...</code></blockquote>")
+
+    # 2. yt-dlp Download Phase (Run in background thread to keep bot responsive)
+    local_filename = None
+    thumb_path = None
+    try:
+        local_filename = await asyncio.to_thread(sync_yt_dlp_download, target_link)
+        if not local_filename or not os.path.exists(local_filename):
+            raise Exception("yt-dlp failed to create file.")
+    except Exception as e:
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{str(e)[:100]}</code></blockquote>")
+        asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
+        return
+
+    # 3. Vault Upload Phase (Exact same premium logic as /download)
+    await anim_msg.edit_text("<blockquote><code>[⚙️] Processing Media Engine...</code></blockquote>")
+
+    filename = os.path.basename(local_filename)
+    file_ext = filename.split('.')[-1].lower() if '.' in filename else 'mp4'
+
+    link_id = secrets.token_urlsafe(8)
+    bot_info = await client.get_me()
+    share_link = f"https://t.me/{bot_info.username}?start={link_id}"
+    channel_caption = f"<blockquote>🔗 <b>Secure Stream Access:</b>\n<code>{share_link}</code></blockquote>"
+
+    try:
+        await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
+        await anim_msg.edit_text("<blockquote><code>[📤] Uploading Stream to Vault...</code></blockquote>")
+        
+        width, height, duration = await get_video_info(local_filename)
+        thumb_path = await get_thumbnail(local_filename)
+
+        saved_msg = await client.send_video(
+            chat_id=CHANNEL_ID, 
+            video=local_filename, 
+            caption=channel_caption, 
+            has_spoiler=True,
+            file_name=filename,
+            width=width,   
+            height=height,
+            duration=duration,
+            thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+            supports_streaming=True
+        )
+            
+        cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.id))
+        conn.commit()
+
+        success_text = (
+            "<blockquote>✅ <b>Stream Extraction Complete!</b>\n"
+            "📦 <i>Secured under a single encrypted link.</i></blockquote>\n"
+            "🔗 <b>Shareable Link:</b>\n"
+            f"<code>{share_link}</code>"
+        )
+        await anim_msg.edit_text(success_text)
+        
+    except Exception as e:
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{str(e)[:100]}</code></blockquote>")
+    finally:
+        if local_filename and os.path.exists(local_filename): os.remove(local_filename)
+        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
+
+
+# ================= Direct URL Download Flow =================
 @app.on_message(filters.command("download") & filters.private)
 async def cmd_download(client, message):
     await safe_delete(message)
@@ -199,7 +368,7 @@ async def cmd_download(client, message):
     msg = await message.reply_text("<blockquote>✨ <b>Direct Downloader</b>\nSend Me Any Direct Download Link 👋\n💡 <i>Type /cancel to abort.</i></blockquote>")
     await track_msg(message.from_user.id, msg.id)
 
-@app.on_message(download_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download"]) & filters.private)
+@app.on_message(download_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download", "stream"]) & filters.private)
 async def process_download_link(client, message):
     if message.from_user.id != ADMIN_ID: return
     
@@ -256,7 +425,6 @@ async def process_download_link(client, message):
                 if is_video_content or file_ext in video_extensions:
                     filename = f"{base_name}.mp4"
                     file_ext = "mp4"
-                    # Fast-lane thumbnail extraction!
                     thumb_path, width, height = await get_remote_meta(url)
                 elif not file_ext:
                     filename = f"{base_name}.bin"
@@ -266,18 +434,16 @@ async def process_download_link(client, message):
 
                 await anim_msg.edit_text("<blockquote><code>[📥] Downloading Data Stream...</code></blockquote>")
                 
-                # --- THE OOM FIX: 0-RAM Download Processing ---
                 async with aiofiles.open(local_filename, mode='wb') as f:
-                    # Download in 4MB chunks and strictly garbage collect
                     async for chunk in resp.content.iter_chunked(4 * 1024 * 1024): 
                         await f.write(chunk)
-                        del chunk # Instantly wipes the RAM trace 
+                        del chunk 
                         
                 if os.path.getsize(local_filename) == 0:
                     raise Exception("Remote server returned 0 Bytes. Link expired!")
                         
     except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{e}</code></blockquote>")
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{str(e)[:100]}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         if local_filename and os.path.exists(local_filename): os.remove(local_filename)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
@@ -327,13 +493,13 @@ async def process_download_link(client, message):
         await anim_msg.edit_text(success_text)
         
     except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{str(e)[:100]}</code></blockquote>")
     finally:
         if local_filename and os.path.exists(local_filename): os.remove(local_filename)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
 # ================= Hidden Upload Logic =================
-@app.on_message(upload_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download"]) & filters.private)
+@app.on_message(upload_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download", "stream"]) & filters.private)
 async def process_upload_text(client, message):
     if message.from_user.id != ADMIN_ID: return
     await safe_delete(message)
