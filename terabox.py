@@ -17,8 +17,8 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-100YOUR_CHANNEL_ID_HERE"))
 XAPI_KEY = os.getenv("XAPI_KEY", "YOUR_XAPIVERSE_KEY")
 FILESHARE_BOT_USERNAME = os.getenv("FILESHARE_BOT_USERNAME", "FSB69_BOT") 
 
-TEMP_MSG_DELETE_TIME = 120    # 2 mins for bot messages
-FILE_DELETE_TIME = 3600       # 1 hour for the actual video
+TEMP_MSG_DELETE_TIME = 120    
+FILE_DELETE_TIME = 3600       
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,7 +30,6 @@ app = Client(
     parse_mode=enums.ParseMode.HTML
 )
 
-# --- Dictionary to track and delete welcome messages ---
 active_welcome_msgs = {}
 
 # ================= Database Setup =================
@@ -55,13 +54,13 @@ async def delete_after(client, chat_id, message_id, delay):
 async def cmd_start(client, message):
     await safe_delete(message)
     msg = await message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Our servers will handle the rest.</i></blockquote>")
-    active_welcome_msgs[message.chat.id] = msg.id # Track message
+    active_welcome_msgs[message.chat.id] = msg.id 
     asyncio.create_task(delete_after(client, msg.chat.id, msg.id, TEMP_MSG_DELETE_TIME))
 
 @app.on_callback_query(filters.regex("terabox_start"))
 async def callback_download_more(client, callback_query):
     msg = await callback_query.message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Ready for the next payload.</i></blockquote>")
-    active_welcome_msgs[callback_query.message.chat.id] = msg.id # Track message
+    active_welcome_msgs[callback_query.message.chat.id] = msg.id 
     await callback_query.answer()
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start"]))
@@ -70,7 +69,6 @@ async def process_terabox_link(client, message):
     raw_text = message.text
     text = raw_text.lower()
     
-    # --- Clean up the old welcome message immediately ---
     if chat_id in active_welcome_msgs:
         try:
             await client.delete_messages(chat_id, active_welcome_msgs[chat_id])
@@ -99,7 +97,7 @@ async def process_terabox_link(client, message):
         
     clean_url = url_match.group(0)
     
-    # ================= CACHE CHECK (Instant Delivery) =================
+    # ================= CACHE CHECK =================
     cursor.execute('SELECT message_id FROM terabox_cache WHERE terabox_url = ?', (clean_url,))
     cached_result = cursor.fetchone()
     
@@ -140,39 +138,53 @@ async def process_terabox_link(client, message):
     # ==================================================================
 
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
-    anim_msg = await message.reply_text("<blockquote><code>[📡] Pinging servers...</code></blockquote>")
+    anim_msg = await message.reply_text("<blockquote><code>[🔍] Fetching payload...</code></blockquote>")
 
     api_url = 'https://xapiverse.com/api/terabox-pro'
     headers = {'Content-Type': 'application/json', 'xAPIverse-Key': XAPI_KEY}
     payload = {"url": clean_url} 
-    
-    video_url, fallback_stream_url, direct_stream_url, thumb_url, file_name, duration_str, size_fmt = None, None, None, None, "terabox_video.mp4", "Unknown", "Unknown"
     timeout = aiohttp.ClientTimeout(total=3600) 
     
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(api_url, json=payload, headers=headers) as resp:
-                data = await resp.json()
-                if data.get("status") == "success" and data.get("list"):
-                    file_data = data["list"][0]
-                    # EXTRACTING ALL BYPASS URLs
-                    video_url = file_data.get("fast_download_link") or file_data.get("download_link")
-                    fallback_stream_url = file_data.get("fast_stream_url", {}).get("1080p")
-                    direct_stream_url = file_data.get("stream_url")
-                    thumb_url = file_data.get("thumbnail")
-                    file_name = file_data.get("name", "terabox_video.mp4")
-                    duration_str = file_data.get("duration", "00:00")
-                    size_fmt = file_data.get("size_formatted", "Unknown")
-                else:
-                    raise Exception(data.get("message", "API returned an empty list."))
-                    
-    except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ <b>API Error:</b>\n<code>{e}</code></blockquote>")
-        asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
-        return
+    video_url = None
+    thumb_url = None
+    file_name = "terabox_video.mp4"
+    duration_str = "Unknown"
+    size_fmt = "Unknown"
+    
+    api_success = False
 
-    if not video_url:
-        await anim_msg.edit_text("<blockquote>❌ <b>Extraction Failed.</b> Link dead or private.</blockquote>")
+    # 🥷 3-ATTEMPT RETRY LOOP FOR API STABILITY
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(api_url, json=payload, headers=headers) as resp:
+                    data = await resp.json()
+                    if data.get("status") == "success" and data.get("list"):
+                        file_data = data["list"][0]
+                        
+                        # 🎯 STREAM PRIORITY: 1080p -> 720p -> 480p -> fallback
+                        streams = file_data.get("fast_stream_url", {})
+                        video_url = streams.get("1080p") or streams.get("720p") or streams.get("480p") 
+                        
+                        # Extreme fallback just in case stream array is empty
+                        if not video_url:
+                            video_url = file_data.get("stream_url") or file_data.get("fast_download_link") or file_data.get("download_link")
+                        
+                        thumb_url = file_data.get("thumbnail")
+                        file_name = file_data.get("name", "terabox_video.mp4")
+                        duration_str = file_data.get("duration", "00:00")
+                        size_fmt = file_data.get("size_formatted", "Unknown")
+                        
+                        api_success = True
+                        break 
+        except Exception:
+            pass # Silent fail, let the loop retry
+        
+        if not api_success:
+            await asyncio.sleep(2)
+
+    if not api_success or not video_url:
+        await anim_msg.edit_text("<blockquote>❌ <b>Extraction Failed.</b> The file is unavailable.</blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
@@ -200,59 +212,41 @@ async def process_terabox_link(client, message):
                         async with aiofiles.open(thumb_path, mode='wb') as f:
                             await f.write(await t_resp.read())
             
-            # --- HELPER: Safe Downloader ---
-            async def fetch_file(url, path):
-                async with session.get(url) as resp:
-                    if resp.status != 200: return False
-                    content_type = resp.headers.get('Content-Type', '')
-                    if 'text/html' in content_type: return False
-                    async with aiofiles.open(path, mode='wb') as f:
-                        while True:
-                            chunk = await resp.content.read(2 * 1024 * 1024) 
-                            if not chunk: break
-                            await f.write(chunk)
-                    return True
-
-            # 1. ATTEMPT FAST DOWNLOAD LINK
-            success = await fetch_file(video_url, local_filename)
+            stream_downloaded = False
             
-            # 2. THE 1MB SIZE CHECK TRAP 🥷
-            if success and os.path.exists(local_filename):
-                file_size = os.path.getsize(local_filename)
-                if file_size < 1024 * 1024:  # If it's the 70kb error payload
-                    os.remove(local_filename)
-                    success = False
+            # Since fast_stream_urls are .m3u8, we process them via FFmpeg
+            if ".m3u8" in video_url:
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        'ffmpeg', '-i', video_url, '-c', 'copy', local_filename,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await process.communicate()
+                    # Verify successful download > 1MB
+                    if os.path.exists(local_filename) and os.path.getsize(local_filename) > 1024 * 1024:
+                        stream_downloaded = True
+                except Exception:
+                    pass # FFmpeg failed or missing
             
-            # 3. FALLBACK TO SECRET 1080p STREAM
-            if not success:
-                await anim_msg.edit_text("<blockquote><code>[⚠️] Trap Detected. Bypassing via 1080p Stream...</code></blockquote>")
-                stream_downloaded = False
-                
-                # If it's an m3u8 playlist, we must use ffmpeg
-                if fallback_stream_url and ".m3u8" in fallback_stream_url:
-                    try:
-                        process = await asyncio.create_subprocess_exec(
-                            'ffmpeg', '-i', fallback_stream_url, '-c', 'copy', local_filename,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL
-                        )
-                        await process.communicate()
-                        if os.path.exists(local_filename) and os.path.getsize(local_filename) > 1024 * 1024:
+            # Fallback to direct raw download if FFmpeg fails or URL isn't m3u8
+            if not stream_downloaded:
+                async with session.get(video_url) as resp:
+                    if resp.status == 200:
+                        async with aiofiles.open(local_filename, mode='wb') as f:
+                            while True:
+                                chunk = await resp.content.read(2 * 1024 * 1024) 
+                                if not chunk: break
+                                await f.write(chunk)
+                        
+                        if os.path.getsize(local_filename) > 1024 * 1024:
                             stream_downloaded = True
-                    except FileNotFoundError:
-                        pass # FFmpeg not installed on Render, fallback to direct stream
-                
-                # If ffmpeg failed or the stream wasn't m3u8, use direct MP4 stream URL
-                if not stream_downloaded and direct_stream_url:
-                    stream_downloaded = await fetch_file(direct_stream_url, local_filename)
-                    if stream_downloaded and os.path.getsize(local_filename) < 1024 * 1024:
-                        raise Exception("Stream bypass failed. File is locked.")
-                
-                if not stream_downloaded:
-                    raise Exception("All bypass methods blocked by Terabox.")
-                    
-    except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ <b>Download Interrupted:</b>\n<code>{e}</code></blockquote>")
+                            
+            if not stream_downloaded:
+                raise Exception("Download blocked.")
+
+    except Exception:
+        await anim_msg.edit_text("<blockquote>❌ <b>Download Failed.</b> Please try again later.</blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
@@ -263,7 +257,6 @@ async def process_terabox_link(client, message):
     fsb_link = f"https://t.me/{FILESHARE_BOT_USERNAME}?start={link_id}"
     channel_caption = f"🔗 **Access Link:**\n<code>{fsb_link}</code>"
 
-    # Smart File Router
     file_ext = file_name.split('.')[-1].lower() if '.' in file_name else 'mp4'
     video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv']
 
@@ -313,8 +306,8 @@ async def process_terabox_link(client, message):
         
         asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
 
-    except Exception as e:
-        await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
+    except Exception:
+        await anim_msg.edit_text("<blockquote>❌ <b>Upload Error.</b> Please try again later.</blockquote>")
     finally:
         if os.path.exists(local_filename): os.remove(local_filename)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
