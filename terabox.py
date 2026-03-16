@@ -49,6 +49,16 @@ async def delete_after(client, chat_id, message_id, delay):
     try: await client.delete_messages(chat_id, message_id)
     except Exception: pass
 
+# 🥷 THE FAST LINK UNSHORTENER
+async def resolve_redirect(url):
+    try:
+        # We use aiohttp to follow the redirect and grab the final URL
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, allow_redirects=True, timeout=10) as resp:
+                return str(resp.url)
+    except Exception:
+        return url # If it fails, fallback to the original
+
 # ================= Bot Logic =================
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(client, message):
@@ -95,7 +105,13 @@ async def process_terabox_link(client, message):
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
         return
         
-    clean_url = url_match.group(0)
+    short_url = url_match.group(0)
+    
+    await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
+    anim_msg = await message.reply_text("<blockquote><code>[🔍] Fetching...</code></blockquote>")
+
+    # 🥷 1. UNSHORTEN THE LINK FIRST
+    clean_url = await resolve_redirect(short_url)
     
     # ================= CACHE CHECK =================
     cursor.execute('SELECT message_id FROM terabox_cache WHERE terabox_url = ?', (clean_url,))
@@ -133,12 +149,10 @@ async def process_terabox_link(client, message):
             reply_markup=keyboard
         )
         active_welcome_msgs[message.chat.id] = sent_vid.id
+        await safe_delete(anim_msg)
         asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
         return 
     # ==================================================================
-
-    await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
-    anim_msg = await message.reply_text("<blockquote><code>[🔍] Fetching payload...</code></blockquote>")
 
     api_url = 'https://xapiverse.com/api/terabox-pro'
     headers = {'Content-Type': 'application/json', 'xAPIverse-Key': XAPI_KEY}
@@ -153,7 +167,7 @@ async def process_terabox_link(client, message):
     
     api_success = False
 
-    # 🥷 3-ATTEMPT RETRY LOOP FOR API STABILITY
+    # 🥷 2. 3-ATTEMPT RETRY LOOP
     for attempt in range(3):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -162,7 +176,7 @@ async def process_terabox_link(client, message):
                     if data.get("status") == "success" and data.get("list"):
                         file_data = data["list"][0]
                         
-                        # 🎯 STREAM PRIORITY: 1080p -> 720p -> 480p -> fallback
+                        # STREAM PRIORITY: 1080p -> 720p -> 480p -> fallback
                         streams = file_data.get("fast_stream_url", {})
                         video_url = streams.get("1080p") or streams.get("720p") or streams.get("480p") 
                         
@@ -178,7 +192,7 @@ async def process_terabox_link(client, message):
                         api_success = True
                         break 
         except Exception:
-            pass # Silent fail, let the loop retry
+            pass 
         
         if not api_success:
             await asyncio.sleep(2)
@@ -193,6 +207,7 @@ async def process_terabox_link(client, message):
     if len(dur_parts) == 2: dur_secs = int(dur_parts[0]) * 60 + int(dur_parts[1])
     elif len(dur_parts) == 3: dur_secs = int(dur_parts[0]) * 3600 + int(dur_parts[1]) * 60 + int(dur_parts[2])
 
+    # 🥷 3. CLEAN DOWNLOADING STATUS
     await anim_msg.edit_text("<blockquote><code>[📥] Downloading...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.RECORD_VIDEO)
     
@@ -214,7 +229,6 @@ async def process_terabox_link(client, message):
             
             stream_downloaded = False
             
-            # Since fast_stream_urls are .m3u8, we process them via FFmpeg
             if ".m3u8" in video_url:
                 try:
                     process = await asyncio.create_subprocess_exec(
@@ -223,13 +237,12 @@ async def process_terabox_link(client, message):
                         stderr=asyncio.subprocess.DEVNULL
                     )
                     await process.communicate()
-                    # Verify successful download > 1MB
+                    # 1MB TRAP CHECK
                     if os.path.exists(local_filename) and os.path.getsize(local_filename) > 1024 * 1024:
                         stream_downloaded = True
                 except Exception:
-                    pass # FFmpeg failed or missing
+                    pass 
             
-            # Fallback to direct raw download if FFmpeg fails or URL isn't m3u8
             if not stream_downloaded:
                 async with session.get(video_url) as resp:
                     if resp.status == 200:
@@ -239,6 +252,7 @@ async def process_terabox_link(client, message):
                                 if not chunk: break
                                 await f.write(chunk)
                         
+                        # 1MB TRAP CHECK
                         if os.path.getsize(local_filename) > 1024 * 1024:
                             stream_downloaded = True
                             
@@ -250,6 +264,7 @@ async def process_terabox_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
+    # 🥷 4. CLEAN UPLOADING STATUS
     await anim_msg.edit_text("<blockquote><code>[📤] Uploading...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
 
@@ -284,8 +299,6 @@ async def process_terabox_link(client, message):
         cursor.execute('INSERT INTO terabox_cache (terabox_url, message_id) VALUES (?, ?)', (clean_url, saved_msg.id))
         conn.commit()
 
-        await anim_msg.edit_text("<blockquote><code>[✅] Complete</code></blockquote>")
-        
         icon = "🎬" if file_ext in video_extensions else "📄"
         user_caption = (
             f"{icon} <b>{file_name}</b>\n\n"
