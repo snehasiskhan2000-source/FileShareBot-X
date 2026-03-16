@@ -49,18 +49,28 @@ async def delete_after(client, chat_id, message_id, delay):
     try: await client.delete_messages(chat_id, message_id)
     except Exception: pass
 
-# 🥷 THE FAST LINK UNSHORTENER (Now with Firewall Bypass Headers)
+# 🥷 TRUE HTML DOM UNSHORTENER
 async def resolve_redirect(url):
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, allow_redirects=True, timeout=15) as resp:
-                return str(resp.url)
-    except Exception as e:
-        print(f"Redirect Resolve Error: {e}")
+                final_url = str(resp.url)
+                
+                # If HTTP redirect worked perfectly
+                if "surl=" in final_url:
+                    return final_url
+                
+                # If Terabox used a JS/Meta trap, we scrape the DOM for the surl code
+                html_content = await resp.text()
+                match = re.search(r'surl=([A-Za-z0-9_-]+)', html_content)
+                if match:
+                    return f"https://www.1024tera.com/wap/share/filelist?surl={match.group(1)}"
+                    
+                return final_url
+    except Exception:
         return url
 
 # ================= Bot Logic =================
@@ -114,9 +124,8 @@ async def process_terabox_link(client, message):
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
     anim_msg = await message.reply_text("<blockquote><code>[🔍] Fetching...</code></blockquote>")
 
-    # 🥷 1. UNSHORTEN THE LINK FIRST
+    # 🥷 1. DOM UNSHORTENER
     clean_url = await resolve_redirect(short_url)
-    print(f"Processing URL -> Original: {short_url} | Resolved: {clean_url}")
     
     # ================= CACHE CHECK =================
     cursor.execute('SELECT message_id FROM terabox_cache WHERE terabox_url = ?', (clean_url,))
@@ -172,16 +181,16 @@ async def process_terabox_link(client, message):
     
     api_success = False
 
-    # 🥷 2. BULLETPROOF 3-ATTEMPT RETRY LOOP
+    # 🥷 2. CREDIT SAVER PROTOCOL
     for attempt in range(3):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(api_url, json=payload, headers=headers) as resp:
                     data = await resp.json()
+                    
                     if data.get("status") == "success" and data.get("list"):
                         file_data = data["list"][0]
                         
-                        # 🛡️ THE FIX: Safely parse the stream dictionary to prevent silent NoneType crashes
                         streams = file_data.get("fast_stream_url")
                         video_url = None
                         
@@ -190,7 +199,6 @@ async def process_terabox_link(client, message):
                         elif isinstance(streams, str) and streams.startswith("http"):
                             video_url = streams
                         
-                        # Extreme fallback if stream array is empty or None
                         if not video_url:
                             video_url = file_data.get("stream_url") or file_data.get("fast_download_link") or file_data.get("download_link")
                         
@@ -202,9 +210,12 @@ async def process_terabox_link(client, message):
                         api_success = True
                         break 
                     else:
-                        print(f"API Attempt {attempt + 1} Failed: {data}")
-        except Exception as e:
-            print(f"API Attempt {attempt + 1} Exception: {e}")
+                        # ⚠️ CREDIT SAVER: If API actively rejects the link, abort immediately. DO NOT RETRY.
+                        break 
+                        
+        except Exception:
+            # ONLY retry if there was a server crash or timeout
+            pass 
         
         if not api_success:
             await asyncio.sleep(2)
@@ -219,7 +230,6 @@ async def process_terabox_link(client, message):
     if len(dur_parts) == 2: dur_secs = int(dur_parts[0]) * 60 + int(dur_parts[1])
     elif len(dur_parts) == 3: dur_secs = int(dur_parts[0]) * 3600 + int(dur_parts[1]) * 60 + int(dur_parts[2])
 
-    # 🥷 3. CLEAN DOWNLOADING STATUS
     await anim_msg.edit_text("<blockquote><code>[📥] Downloading...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.RECORD_VIDEO)
     
@@ -241,7 +251,7 @@ async def process_terabox_link(client, message):
             
             stream_downloaded = False
             
-            if ".m3u8" in video_url:
+            if video_url and ".m3u8" in video_url:
                 try:
                     process = await asyncio.create_subprocess_exec(
                         'ffmpeg', '-i', video_url, '-c', 'copy', local_filename,
@@ -252,10 +262,10 @@ async def process_terabox_link(client, message):
                     # 1MB TRAP CHECK
                     if os.path.exists(local_filename) and os.path.getsize(local_filename) > 1024 * 1024:
                         stream_downloaded = True
-                except Exception as e:
-                    print(f"FFmpeg Error: {e}")
+                except Exception:
+                    pass 
             
-            if not stream_downloaded:
+            if not stream_downloaded and video_url:
                 async with session.get(video_url) as resp:
                     if resp.status == 200:
                         async with aiofiles.open(local_filename, mode='wb') as f:
@@ -271,13 +281,11 @@ async def process_terabox_link(client, message):
             if not stream_downloaded:
                 raise Exception("Download blocked or file too small.")
 
-    except Exception as e:
-        print(f"Download Exception: {e}")
+    except Exception:
         await anim_msg.edit_text("<blockquote>❌ <b>Download Failed.</b> Please try again later.</blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
-    # 🥷 4. CLEAN UPLOADING STATUS
     await anim_msg.edit_text("<blockquote><code>[📤] Uploading...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
 
@@ -332,8 +340,7 @@ async def process_terabox_link(client, message):
         
         asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
 
-    except Exception as e:
-        print(f"Upload Exception: {e}")
+    except Exception:
         await anim_msg.edit_text("<blockquote>❌ <b>Upload Error.</b> Please try again later.</blockquote>")
     finally:
         if os.path.exists(local_filename): os.remove(local_filename)
@@ -343,4 +350,4 @@ async def process_terabox_link(client, message):
 if __name__ == "__main__":
     print("Starting Terabox Bot...")
     app.run()
-        
+                        
